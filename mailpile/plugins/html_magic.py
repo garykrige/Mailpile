@@ -2,7 +2,7 @@
 # current theme, skin and active plugins.
 #
 import mailpile.config
-from mailpile.commands import Command
+from mailpile.commands import Command, RenderPage
 from mailpile.i18n import gettext as _
 from mailpile.i18n import ngettext as _n
 from mailpile.plugins import PluginManager
@@ -26,24 +26,45 @@ _plugins = PluginManager(builtin=__file__)
 
 ##[ Commands ]################################################################
 
-
-class JsApi(Command):
+class JsApi(RenderPage):
     """Output API bindings, plugin code and CSS as CSS or Javascript"""
     SYNOPSIS = (None, None, 'jsapi', None)
     ORDER = ('Internals', 0)
     HTTP_CALLABLE = ('GET', )
     HTTP_AUTH_REQUIRED = 'Maybe'
+    HTTP_QUERY_VARS = {'ts': 'Cache busting timestamp'}
+
+    def max_age(self):
+        # Set a long TTL if we know which version of the config this request
+        # applies to, as changed config should avoid the outdated cache.
+        if 'ts' in self.data:
+            return 7 * 24 * 3600
+        else:
+            return 30
+
+    def etag_data(self):
+        # This summarizes the config state this page depends on, for
+        # generating an ETag which the HTTPD can use for caching.
+        config = self.session.config
+        return ([config.version,
+                 config.timestamp,
+                 # The above should be enough, the rest is belt & suspenders
+                 config.prefs.language,
+                 config.web.setup_complete] +
+                sorted(config.sys.plugins))
 
     def command(self, save=True, auto=False):
-        session, config = self.session, self.session.config
-
-        urlmap = UrlMap(session)
         res = {
             'api_methods': [],
             'javascript_classes': [],
             'css_files': []
         }
+        if self.args:
+            # Short-circuit if we're serving templates...
+            return self._success(_('Serving up API content'), result=res)
 
+        session, config = self.session, self.session.config
+        urlmap = UrlMap(session)
         for method in ('GET', 'POST', 'UPDATE', 'DELETE'):
             for cmd in urlmap._api_commands(method, strict=True):
                 cmdinfo = {

@@ -1,4 +1,5 @@
 import mailpile.config
+import mailpile.security as security
 from mailpile.commands import Command
 from mailpile.i18n import gettext as _
 from mailpile.i18n import ngettext as _n
@@ -26,14 +27,16 @@ _plugins.register_config_section('tags', ["Tags", {
 
     # Functional attributes
     'type': ['Tag type', [
-        'tag', 'group', 'attribute', 'unread', 'inbox',
+        'tag', 'group', 'attribute', 'unread', 'inbox', 'search',
         # Maybe TODO: 'folder', 'shadow',
+        'profile', 'mailbox',                         # Accounts, Mailboxes
         'drafts', 'blank', 'outbox', 'sent',          # composing and sending
         'replied', 'fwded', 'tagged', 'read', 'ham',  # behavior tracking tags
         'trash', 'spam'                               # junk mail tags
     ], 'tag'],
     'flag_hides': ['Hide tagged messages from searches?', 'bool', False],
     'flag_editable': ['Mark tagged messages as editable?', 'bool', False],
+    'flag_msg_only': ['Never apply to entire conversations', 'bool', False],
 
     # Tag display attributes for /in/tag or searching in:tag
     'template': ['Default tag display template', 'str', 'index'],
@@ -48,11 +51,7 @@ _plugins.register_config_section('tags', ["Tags", {
     'display': ['Display context in UI', ['priority', 'tag', 'subtag',
                                           'archive', 'invisible'], 'tag'],
     'display_order': ['Order in lists', 'float', 0],
-    'parent': ['ID of parent tag, if any', 'str', ''],
-
-    # Outdated crap
-    'hides_flag': ['DEPRECATED', 'ignore', None],
-    'write_flag': ['DEPRECATED', 'ignore', None],
+    'parent': ['ID of parent tag, if any', 'str', '']
 }, {}])
 
 _plugins.register_config_section('filters', ["Filters", {
@@ -60,14 +59,8 @@ _plugins.register_config_section('filters', ["Filters", {
     'terms': ['Search terms', 'str', ''],
     'comment': ['Human readable description', 'str', ''],
     'type': ['Filter type', FILTER_TYPES, FILTER_TYPES[0]],
+    'primary_tag': ['Tag dedicated to this filter', 'str', ''],
 }, {}])
-
-_plugins.register_config_variables('sys', {
-    'writable_tags': ['DEPRECATED', 'str', []],
-    'invisible_tags': ['DEPRECATED', 'str', []],
-})
-
-#INFO_HIDES_TAG_METADATA = ('flag_editable', 'flag_hides')
 
 
 def GetFilters(cfg, filter_on=None, types=FILTER_TYPES[:1]):
@@ -89,7 +82,7 @@ def GetFilters(cfg, filter_on=None, types=FILTER_TYPES[:1]):
     return flist
 
 
-def MoveFilter(cfg, filter_id, filter_new_id):
+def FilterMove(cfg, filter_id, filter_new_id):
     def swap(f1, f2):
         tmp = cfg.filters[f1]
         cfg.filters[f1] = cfg.filters[f2]
@@ -102,6 +95,18 @@ def MoveFilter(cfg, filter_id, filter_new_id):
     elif ffrm < fto:
         for fid in range(ffrm, fto):
             swap(b36(fid), b36(fid + 1))
+
+
+def FilterDelete(cfg, *filter_ids):
+    filter_ids = list(filter_ids)
+    filter_ids.sort(key=lambda fid: int(fid, 36))
+    filters = cfg.filters
+    for fid in reversed(filter_ids):
+        lastid = b36(len(filters)-1).lower()
+        if fid <= lastid:
+            if lastid != fid:
+                cfg.filter_move(fid, lastid)
+            del filters[lastid]
 
 
 def GetTags(cfg, tn=None, default=None, **kwargs):
@@ -129,10 +134,16 @@ def GetTags(cfg, tn=None, default=None, **kwargs):
     if kwargs:
         tv = cfg.tags.values()
         for kw in kwargs:
-            want = unicode(kwargs[kw]).lower()
-            results.append([t._key for t in tv
-                            if (want == '*' or
-                                unicode(t[kw]).lower() == want)])
+            want = kwargs[kw]
+            if not isinstance(want, (list, tuple)):
+                want = [want]
+            want = [unicode(w).lower() for w in want]
+            if kw == 'tid':
+                results.append([str(k) for k in want if str(k) in cfg.tags])
+            else:
+                results.append([t._key for t in tv
+                                if ('*' in want or
+                                    unicode(t[kw]).lower() in want)])
 
     if (tn or kwargs) and not results:
         return default
@@ -141,10 +152,6 @@ def GetTags(cfg, tn=None, default=None, **kwargs):
         for r in results:
             tags &= set(r)
         tags = [cfg.tags[t] for t in tags]
-        if 'display' in kwargs:
-            tags.sort(key=lambda k: (k.get('display_order', 0), k.slug))
-        else:
-            tags.sort(key=lambda k: k.slug)
         return tags
 
 
@@ -211,7 +218,8 @@ mailpile.config.ConfigManager.get_tags = GetTags
 mailpile.config.ConfigManager.get_tag_id = GetTagID
 mailpile.config.ConfigManager.get_tag_info = GetTagInfo
 mailpile.config.ConfigManager.get_filters = GetFilters
-mailpile.config.ConfigManager.filter_move = MoveFilter
+mailpile.config.ConfigManager.filter_move = FilterMove
+mailpile.config.ConfigManager.filter_delete = FilterDelete
 
 
 ##[ Commands ]################################################################
@@ -234,14 +242,18 @@ class TagCommand(Command):
 
 class Tag(TagCommand):
     """Add or remove tags on a set of messages"""
-    SYNOPSIS = (None, 'tag', 'tag', '<[+|-]tags> <msgs>')
+    SYNOPSIS = (None, 'tag', 'tag', '[--conversations|--messages] '
+                                    '<[+|-]tags> <msgs>')
     ORDER = ('Tagging', 0)
     HTTP_CALLABLE = ('POST', )
     HTTP_POST_VARS = {
         'mid': 'message-ids',
         'add': 'tags',
-        'del': 'tags'
+        'del': 'tags',
+        'conversations': '[yes|no|auto]',
+        'context': 'search context, for tagging relative results'
     }
+    COMMAND_SECURITY = security.CC_TAG_EMAIL
 
     class CommandResult(TagCommand.CommandResult):
         def as_text(self):
@@ -258,35 +270,63 @@ class Tag(TagCommand):
                 what.append('Untagged ' +
                             ', '.join([k['name'] for k, ids
                                        in self.result['untagged']]))
-            return '%s (%d messages)' % (', '.join(what),
-                                         len(self.result['msg_ids']))
+            count = len(self.result['msg_ids'])
+            whats = ', '.join(what)
+            convs = (_n('%d conversation', '%d conversation', count)
+                     if self.result.get('conversations') else
+                     _n('%d message', '%d messages', count)) % count
+            return '%s (%s)' % (whats, convs)
 
     def _get_ops_and_msgids(self, words):
+        # If we are asked to both add and remove a tag, we do neither as
+        # that is nonsense without knowing the order of the operations.
+        deling = set(self.data.get('del', []))
+        adding = set(self.data.get('add', []))
+        ops = (['-%s' % t for t in (deling-adding) if t] +
+               ['+%s' % t for t in (adding-deling) if t])
+        conversations = {'yes': True, 'no': False, 'auto': None
+                         }[self.data.get('conversations',
+                                         ['auto'])[0].lower()]
         if 'mid' in self.data:
-            msg_ids = [int(m.replace('=', ''), 36) for m in self.data['mid']]
-            ops = (['+%s' % t for t in self.data.get('add', []) if t] +
-                   ['-%s' % t for t in self.data.get('del', []) if t])
+            words = ['=%s' % m for m in self.data['mid']]
         else:
-            ops = []
-            while words and words[0][0] in ('-', '+'):
-                ops.append(words.pop(0))
-            msg_ids = self._choose_messages(words)
-        return ops, msg_ids
+            while words and words[0][:1] in ('-', '+'):
+                op = words.pop(0)
+                if op in ('--conversations', '--messages'):
+                    conversations = True if (op[:3] == '--c') else False
+                else:
+                    ops.append(op)
+        msg_ids = self._choose_messages(words)
+        return ops, msg_ids, conversations
 
-    def _do_tagging(self, ops, msg_ids, save=True, auto=False):
+    def _do_tagging(self, ops, msg_ids, conversations, save=True, auto=False):
         idx = self._idx()
         rv = {
+            'conversations': False,
             'msg_ids': [b36(i) for i in msg_ids],
             'tagged': [],
             'untagged': []
         }
+
         for op in ops:
             tag = self.session.config.get_tag(op[1:])
             if tag:
+                # FIXME: This should depend on more factors!
+                #    - Tags should have metadata about default scope
+                if conversations is None:
+                    conversation = ('flat' not in (self.session.order or ''))
+                    if (tag.flag_msg_only or
+                            tag.flag_editable or
+                            tag.type == 'attribute'):
+                        conversation = False
+                else:
+                    conversation = conversations
+                if conversation:
+                    rv['conversations'] = True
+
                 tag_id = tag._key
                 tag = tag.copy()
                 tag["tid"] = tag_id
-                conversation = ('flat' not in (self.session.order or ''))
                 if op[0] == '-':
                     removed = idx.remove_tag(self.session, tag_id,
                                              msg_idxs=msg_ids,
@@ -301,19 +341,33 @@ class Tag(TagCommand):
                                                       for i in added])))
                 # Record behavior
                 if len(msg_ids) < 15:
-                    for t in self.session.config.get_tags(type='tagged'):
+                    for t in self.session.config.get_tags(type='tagged',
+                                                          default=[]):
                         idx.add_tag(self.session, t._key, msg_idxs=msg_ids)
             else:
                 self.session.ui.warning('Unknown tag: %s' % op)
 
-        self.event.data['undo'] = _("Untag %d messages") % len(msg_ids)
+        if rv['conversations']:
+            undo_msg = _n('Untag %d conversation',
+                          'Untag %d conversations',
+                          len(msg_ids)) % len(msg_ids)
+            done_msg = _n('Tagged %d conversation',
+                          'Tagged %d conversations',
+                          len(msg_ids)) % len(msg_ids)
+        else:
+            undo_msg = _n('Untag %d message',
+                          'Untag %d messages', len(msg_ids)) % len(msg_ids)
+            done_msg = _n('Tagged %d message',
+                          'Tagged %d messages', len(msg_ids)) % len(msg_ids)
+
+        self.event.data['undo'] = undo_msg
         self.event.private_data['undo'] = {
             'tagged': [[t['tid'], mids] for t, mids in rv['tagged']],
             'untagged': [[t['tid'], mids] for t, mids in rv['untagged']],
         }
 
         self.finish(save=save)
-        return self._success(_('Tagged %d messages') % len(msg_ids), rv)
+        return self._success(done_msg, rv)
 
     @classmethod
     def Undo(cls, undo, event):
@@ -347,7 +401,7 @@ class TagLater(Tag):
     def command(self, **kwargs):
         args = list(self.args)
         seconds = args.pop(0)
-        ops, msg_ids = self._get_ops_and_msgids(args)
+        ops, msg_ids, conversations = self._get_ops_and_msgids(args)
         # FIXME: Schedule event!
         return self._success(_('Scheduled %d messages for future tagging')
                              % len(msg_ids), {
@@ -379,13 +433,15 @@ class AddTag(TagCommand):
         # Optional initial attributes of tags
         'icon': 'icon-tag',
         'label': 'display as label in search results, or not',
-        'label_color': '03-gray-dark',
+        'label_color': 'the color of the label',
         'display': 'tag display type',
         'template': 'tag template type',
         'search_terms': 'default search associated with this tag',
         'magic_terms': 'magic search terms associated with this tag',
         'parent': 'parent tag ID',
     }
+    COMMAND_SECURITY = security.CC_CHANGE_TAGS
+
     OPTIONAL_VARS = ['icon', 'label', 'label_color', 'display', 'template',
                      'search_terms', 'parent']
 
@@ -407,19 +463,24 @@ class AddTag(TagCommand):
                 'rules': self.session.config.tags.rules['_any'][1]
             })
 
+        # Check arguments/POST data, and make sure we have matching numbers
+        # of names and slugs for the tags we're about to create.
         slugs = self.data.get('slug', [])
         names = self.data.get('name', [])
         if slugs and len(names) != len(slugs):
             return self._error('Name/slug pairs do not match')
         elif names and not slugs:
             slugs = [Slugify(n, config.tags) for n in names]
+        # This adds CLI-style arguments to the list
         slugs.extend([Slugify(s, config.tags) for s in self.args])
         names.extend(self.args)
 
+        # Check Slug is valid
         for slug in slugs:
             if slug != Slugify(slug, config.tags):
                 return self._error('Invalid tag slug: %s' % slug)
 
+        # Check Tag is unique
         for tag in config.tags.values():
             if tag.slug in slugs:
                 return self._error('Tag already exists: %s/%s' % (tag.slug,
@@ -432,13 +493,20 @@ class AddTag(TagCommand):
                 if len(vlist) > i and vlist[i]:
                     tags[i][v] = vlist[i]
         if tags:
+            # Add Tag to config
             config.tags.extend(tags)
             if save:
                 self._reorder_all_tags()
             self.finish(save=save)
 
-        return self._success(_('Added %d tags') % len(tags),
-                             {'added': tags})
+        # Get full Tag objects of added tags to return
+        results = []
+        for tag in tags:
+            results.append(GetTagInfo(self.session.config, tag['slug']))
+
+        # Return success
+        return self._success(_('Added %d tags') % len(results),
+                             {'added': results})
 
 
 class ListTags(TagCommand):
@@ -446,6 +514,15 @@ class ListTags(TagCommand):
     SYNOPSIS = (None, 'tags', 'tags', '[<wanted>|!<wanted>] [...]')
     ORDER = ('Tagging', 0)
     HTTP_STRICT_VARS = False
+    COMMAND_CACHE_TTL = 3600
+    LOG_NOTHING = True  # Avoid gunking up the event log with Boring Stuff
+
+    def cache_requirements(self, result):
+        if result:
+            return set([u'!config'] +
+                       [u'%s:in' % ti['slug'] for ti in result.result['tags']])
+        else:
+            return set([u'!config'])
 
     class CommandResult(TagCommand.CommandResult):
         def as_text(self):
@@ -476,8 +553,11 @@ class ListTags(TagCommand):
             else:
                 args.append(arg)
         for kw in self.data:
-            if kw in self.session.config.tags.rules:
+            if kw in ('tid', 'mode') or kw in self.session.config.tags.rules:
                 search[kw] = self.data[kw]
+            elif kw not in ('only', 'not', '_method', '_recursion', 'context'):
+                from mailpile.urlmap import BadDataError
+                raise BadDataError('Bad variable (%s)' % (kw))
 
         wanted = [t.lower() for t in args if not t.startswith('!')]
         unwanted = [t[1:].lower() for t in args if t.startswith('!')]
@@ -485,17 +565,18 @@ class ListTags(TagCommand):
         unwanted.extend([t.lower() for t in self.data.get('not', [])])
 
         unread_messages = set()
-        for tag in self.session.config.get_tags(type='unread'):
+        for tag in self.session.config.get_tags(type='unread', default=[]):
             unread_messages |= idx.TAGS.get(tag._key, set())
 
         excluded_messages = set()
-        for tag in self.session.config.get_tags(flag_hides=True):
+        for tag in self.session.config.get_tags(flag_hides=True, default=[]):
             excluded_messages |= idx.TAGS.get(tag._key, set())
 
         mode = search.get('mode', 'default')
         if 'mode' in search:
             del search['mode']
 
+        search['default'] = []
         for tag in self.session.config.get_tags(**search):
             if wanted and tag.slug.lower() not in wanted:
                 continue
@@ -516,7 +597,7 @@ class ListTags(TagCommand):
             # List subtags...
             if recursion == 0:
                 subtags = self.session.config.get_tags(parent=tid)
-                subtags.sort(key=lambda k: (k.get('display_order', 0), k.slug))
+                subtags.sort(key=lambda k: k.get('slug', 'zzzz'))
             else:
                 subtags = None
 
@@ -540,6 +621,8 @@ class ListTags(TagCommand):
                                                ).run().result['tags']
 
             result.append(info)
+        result.sort(key=lambda k: (float(k.get('display_order', 0)),
+                                         k.get('slug', 'zzz')))
         return self._success(_('Listed %d tags') % len(result), {
             'search': search,
             'wanted': wanted,
@@ -556,6 +639,7 @@ class DeleteTag(TagCommand):
     HTTP_POST_VARS = {
         "tag" : "tag(s) to delete"
     }
+    COMMAND_SECURITY = security.CC_CHANGE_TAGS
 
     class CommandResult(TagCommand.CommandResult):
         def as_text(self):
@@ -611,36 +695,72 @@ class FilterCommand(Command):
 
 class Filter(FilterCommand):
     """Add auto-tag rule for current search or terms"""
-    SYNOPSIS = (None, 'filter', None, '[new|read] [notag] [=<mid>] '
-                                      '[<terms>] [+<tag>] [-<tag>] '
-                                      '[<comment>]')
+    SYNOPSIS = (None, 'filter', 'filter', '[new|read] [notag|maketag] [=<mid>] '
+                                          '[<terms>] [+<tag>] [-<tag>] '
+                                          '[<comment>]')
     ORDER = ('Tagging', 1)
     HTTP_CALLABLE = ('POST', )
+    HTTP_POST_VARS = {
+        'comment': '...',
+        'terms': '...',
+        'add-tag': 'tag,tag,tag,... or !CREATE',
+        'del-tag': 'tag,tag,tag,... ',
+        'mark-read': 'yes or no',
+        'skip-inbox': 'yes or no',
+        'never-spam': 'yes or no',
+        'create-tag': 'yes or no',
+        'tag-icon': 'icon',
+        'tag-color': 'color',
+        'replace': 'filter ID'
+    }
+    COMMAND_SECURITY = security.CC_CHANGE_FILTERS
+
+    def _truthy(self, var):
+        return (self.data.get(var, ['n'])[0][:1].lower()
+                in ('y', 't', 'o', '1'))
 
     def command(self, save=True):
         session, config = self.session, self.session.config
         args = list(self.args)
 
         flags = []
-        while args and args[0] in ('add', 'set', 'new', 'read', 'notag'):
+        while args and args[0] in ('add', 'set', 'new', 'read',
+                                   'notag', 'maketag'):
             flags.append(args.pop(0))
+        if self._truthy('create-tag'):
+            flags.append('maketag')
 
-        if args and args[0] and args[0][0] == '=':
+        if args and args[0][:1] == '=':
             filter_id = args.pop(0)[1:]
         else:
-            filter_id = None
+            filter_id = self.data.get('replace', [None])[0] or None
 
-        if args and args[0] and args[0][0] == '@':
+        if args and args[0][:1] == '@':
             filter_type = args.pop(0)[1:]
         else:
             filter_type = FILTER_TYPES[0]
+
+        # Convert HTTP variable tag ops...
+        for tag in self.data.get('add-tag', []):
+            args.append('+%s' % tag)
+        for tag in self.data.get('del-tag', []):
+            args.append('-%s' % tag)
+        if self._truthy('mark-read'):
+            args.append('-new')
+        if self._truthy('skip-inbox'):
+            args.append('-inbox')
+        if self._truthy('never-spam'):
+            args.append('-spam')
 
         auto_tag = False
         if 'read' in flags:
             terms = ['@read']
         elif 'new' in flags:
             terms = ['*']
-        elif args[0] and args[0][0] not in ('-', '+'):
+        elif self.data.get('terms', [''])[0]:
+            terms = self.data['terms'][0].strip().split()
+            auto_tag = True
+        elif args and args[0][:1] not in ('-', '+'):
             terms = []
             while args and args[0][0] not in ('-', '+'):
                 terms.append(args.pop(0))
@@ -648,13 +768,33 @@ class Filter(FilterCommand):
             terms = session.searched
             auto_tag = True
 
-        if not terms or (len(args) < 1):
+        tag_ops = []
+        while args and args[0][0] in ('-', '+'):
+            tag_ops.append(args.pop(0))
+
+        comment = self.data.get('comment', [None])[0] or ' '.join(args)
+
+        if filter_id:
+            primary_tag = config.filters[filter_id].primary_tag or None
+        else:
+            primary_tag = None
+
+        if primary_tag is None and 'maketag' in flags:
+            if not comment:
+                raise UsageError(_('Need tag name'))
+            result = AddTag(session, arg=[comment]).run(save=False).result
+            primary_tag = result['added'][0]['tid']
+
+        if not terms or (len(tag_ops) < 1):
             raise UsageError(_('Need flags and search terms or a hook'))
 
         tags, tids = [], []
-        while args and args[0][0] in ('-', '+'):
-            tag = args.pop(0)
-            tid = config.get_tag_id(tag[1:])
+        for tag in tag_ops:
+            if tag[1:] == '!PRIMARY':
+                tid = primary_tag
+                tag = tag[0] + tid
+            else:
+                tid = config.get_tag_id(tag[1:])
             if tid is not None:
                 tags.append(tag)
                 tids.append(tag[0] + tid)
@@ -669,7 +809,8 @@ class Filter(FilterCommand):
                 raise UsageError()
 
         filter_dict = {
-            'comment': ' '.join(args),
+            'primary_tag': primary_tag,
+            'comment': comment,
             'terms': ' '.join(terms),
             'tags': ' '.join(tids),
             'type': filter_type
@@ -677,10 +818,22 @@ class Filter(FilterCommand):
         if filter_id:
             config.filters[filter_id] = filter_dict
         else:
-            config.filters.append(filter_dict)
+            filter_id = config.filters.append(filter_dict)
+
+        if 'maketag' in flags and primary_tag and primary_tag in config.tags:
+            tag_icon = self.data.get('tag-icon', [None])[0]
+            tag_color = self.data.get('tag-color', [None])[0]
+            if tag_icon:
+                config.tags[primary_tag].icon = tag_icon
+            if tag_color:
+                config.tags[primary_tag].label_color = tag_color
+            config.tags[primary_tag].name = comment
+            config.tags[primary_tag].slug = 'saved-search-%s' % filter_id
 
         self.finish(save=save)
-        return True
+
+        filter_dict['id'] = filter_id
+        return self._success(_('Added new filter'), result=filter_dict)
 
 
 class DeleteFilter(FilterCommand):
@@ -688,33 +841,28 @@ class DeleteFilter(FilterCommand):
     SYNOPSIS = (None, 'filter/delete', None, '<filter-id>')
     ORDER = ('Tagging', 1)
     HTTP_CALLABLE = ('POST', 'DELETE')
+    COMMAND_SECURITY = security.CC_CHANGE_FILTERS
 
     def command(self):
         session, config = self.session, self.session.config
         if len(self.args) < 1:
             raise UsageError('Delete what?')
 
-        removed = 0
-        filters = config.get('filter', {})
-        filter_terms = config.get('filter_terms', {})
         args = list(self.args)
-        for fid in self.args:
-            if fid not in filters:
-                match = [f for f in filters if filter_terms[f] == fid]
-                if match:
-                    args.remove(fid)
-                    args.extend(match)
+        args.sort(key=lambda fid: int(fid, 36))
 
-        for fid in args:
-            if (config.parse_unset(session, 'filter:%s' % fid)
-                    and config.parse_unset(session, 'filter_tags:%s' % fid)
-                    and config.parse_unset(session, 'filter_terms:%s' % fid)):
+        filter_keys = config.get('filters', {}).keys()
+        removed = 0
+        for fid in reversed(args):
+            if fid in filter_keys:
+                self.session.config.filter_delete(fid)
                 removed += 1
             else:
                 session.ui.warning('Failed to remove %s' % fid)
         if removed:
             self.finish()
-        return True
+
+        return self._success(_('Removed %d filter(s)') % removed)
 
 
 class ListFilters(Command):
@@ -788,6 +936,7 @@ class MoveFilter(ListFilters):
     SYNOPSIS = (None, 'filter/move', None, '<filter-id> <position>')
     ORDER = ('Tagging', 1)
     HTTP_CALLABLE = ('POST', 'UPDATE')
+    COMMAND_SECURITY = security.CC_CHANGE_FILTERS
 
     def command(self):
         self.session.config.filter_move(self.args[0], self.args[1])

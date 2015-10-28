@@ -3,6 +3,7 @@ import os
 import time
 
 import mailpile.config
+import mailpile.security as security
 from mailpile.commands import Command
 from mailpile.i18n import gettext as _
 from mailpile.i18n import ngettext as _n
@@ -30,6 +31,7 @@ class ExportMail(Command):
     """Export messages to an external mailbox"""
     SYNOPSIS = (None, 'export', None, '[-flat] [-notags] <msgs> [<fmt>:<path>]')
     ORDER = ('Searching', 99)
+    COMMAND_SECURITY = security.CC_ACCESS_FILESYSTEM
 
     def export_path(self, mbox_type):
         if mbox_type == 'mbox':
@@ -42,14 +44,12 @@ class ExportMail(Command):
             return mailbox.mbox(path)
         elif mbox_type == 'maildir':
             return mailbox.Maildir(path)
-        raise UsageError('Invalid mailbox type: %s' % mbox_type)
+        raise UsageError('Invalid mailbox type: %s (must be mbox or maildir)'
+                         % mbox_type)
 
     def command(self, save=True):
         session, config, idx = self.session, self.session.config, self._idx()
         mbox_type = config.prefs.export_format
-
-        if self.session.config.sys.lockdown:
-            return self._error(_('In lockdown, doing nothing.'))
 
         args = list(self.args)
         if args and ':' in args[-1]:
@@ -84,14 +84,30 @@ class ExportMail(Command):
         # Let's always export in the same order. Stability is nice.
         msg_idxs.sort()
 
-        mbox = self.create_mailbox(mbox_type, path)
+        try:
+            mbox = self.create_mailbox(mbox_type, path)
+        except (IOError, OSError):
+            mbox = None
+        if mbox is None:
+            if not os.path.exists(os.path.dirname(path)):
+                reason = _('Parent directory does not exist.')
+            else:
+                reason = _('Is the disk full? Are permissions lacking?')
+            return self._error(_('Failed to create mailbox: %s') % reason)
+
         exported = {}
+        failed = []
         while msg_idxs:
             msg_idx = msg_idxs.pop(0)
             if msg_idx not in exported:
                 e = Email(idx, msg_idx)
-                session.ui.mark('Exporting =%s ...' % e.msg_mid())
+                session.ui.mark(_('Exporting message =%s ...') % e.msg_mid())
                 fd = e.get_file()
+                if fd is None:
+                    failed.append(e.msg_mid())
+                    session.ui.warning(_('Message =%s is unreadable! Skipping.'
+                                         ) % e.msg_mid())
+                    continue
                 try:
                     data = fd.read()
                     if not notags:
@@ -115,12 +131,14 @@ class ExportMail(Command):
                     fd.close()
 
         mbox.flush()
-
+        result = {
+            'exported': len(exported),
+            'created': path
+        }
+        if failed:
+            result['failed'] = failed
         return self._success(
             _('Exported %d messages to %s') % (len(exported), path),
-            {
-                'exported': len(exported),
-                'created': path
-            })
+            result)
 
 _plugins.register_commands(ExportMail)

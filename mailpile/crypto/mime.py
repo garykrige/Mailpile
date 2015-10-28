@@ -31,12 +31,22 @@ def Normalize(payload):
     return text
 
 
+def MessageAsString(part, unixfrom=False):
+    buf = StringIO.StringIO()
+    Generator(buf).flatten(part, unixfrom=unixfrom)
+    return Normalize(buf.getvalue()).replace('--\r\n--', '--\r\n\r\n--')
+
+
 class EncryptionFailureError(ValueError):
-    pass
+    def __init__(self, message, to_keys):
+        ValueError.__init__(self, message)
+        self.to_keys = to_keys
 
 
 class SignatureFailureError(ValueError):
-    pass
+    def __init__(self, message, from_key):
+        ValueError.__init__(self, message)
+        self.from_key = from_key
 
 
 DEFAULT_CHARSETS = ['utf-8', 'iso-8859-1']
@@ -70,7 +80,7 @@ def UnwrapMimeCrypto(part, protocols=None, psi=None, pei=None, charsets=None):
     """
     part.signature_info = SignatureInfo(parent=psi)
     part.encryption_info = EncryptionInfo(parent=pei)
-    mimetype = part.get_content_type()
+    mimetype = part.get_content_type() or 'text/plain'
     if part.is_multipart():
 
         # FIXME: Check the protocol. PGP? Something else?
@@ -101,6 +111,8 @@ def UnwrapMimeCrypto(part, protocols=None, psi=None, pei=None, charsets=None):
                 part.set_payload(payload.get_payload())
                 for h in payload.keys():
                     del part[h]
+                if 'content-type' in part:
+                    del part['content-type']  # May be missing from child
                 for h, v in payload.items():
                     part.add_header(h, v)
 
@@ -138,6 +150,8 @@ def UnwrapMimeCrypto(part, protocols=None, psi=None, pei=None, charsets=None):
                 part.set_payload(newpart.get_payload())
                 for h in newpart.keys():
                     del part[h]
+                if 'content-type' in part:
+                    del part['content-type']  # May be missing from child
                 for h, v in newpart.items():
                     part.add_header(h, v)
 
@@ -232,8 +246,10 @@ class MimeWrapper:
         self.sender = sender
         self.cleaner = cleaner
         self.recipients = recipients or []
-        self.container = MIMEMultipart()
-        self.container.set_type(self.CONTAINER_TYPE)
+        self.container = c = MIMEMultipart()
+        c.set_type(self.CONTAINER_TYPE)
+        c.signature_info = SignatureInfo(bubbly=False)
+        c.encryption_info = EncryptionInfo(bubbly=False)
         if self.cleaner:
             self.cleaner(self.container)
         for pn, pv in self.CONTAINER_PARAMS:
@@ -243,7 +259,18 @@ class MimeWrapper:
         return NotImplementedError("Please override me")
 
     def attach(self, part):
-        self.container.attach(part)
+        c = self.container
+        c.attach(part)
+
+        if not hasattr(part, 'signature_info'):
+            part.signature_info = SignatureInfo(parent=c.signature_info)
+            part.encryption_info = EncryptionInfo(parent=c.encryption_info)
+        else:
+            part.signature_info.parent = c.signature_info
+            part.signature_info.bubbly = True
+            part.encryption_info.parent = c.encryption_info
+            part.encryption_info.bubbly = True
+
         if self.cleaner:
             self.cleaner(part)
         del part['MIME-Version']
@@ -253,9 +280,7 @@ class MimeWrapper:
         return people
 
     def flatten(self, msg, unixfrom=False):
-        buf = StringIO.StringIO()
-        Generator(buf).flatten(msg, unixfrom=unixfrom, linesep='\r\n')
-        return buf.getvalue()
+        return MessageAsString(msg, unixfrom=unixfrom)
 
     def get_only_text_part(self, msg):
         count = 0
@@ -264,7 +289,8 @@ class MimeWrapper:
             if part.is_multipart():
                 continue
             count += 1
-            if part.get_content_type() != 'text/plain' or count != 1:
+            mimetype = part.get_content_type() or 'text/plain'
+            if mimetype != 'text/plain' or count != 1:
                 return False
             else:
                 only_text_part = part
@@ -276,6 +302,11 @@ class MimeWrapper:
             if not hl.startswith('content-') and not hl.startswith('mime-'):
                 self.container[h] = msg[h]
                 del msg[h]
+            elif hl == 'mime-version':
+                del msg[h]
+        if hasattr(msg, 'signature_info'):
+            self.container.signature_info = msg.signature_info
+            self.container.encryption_info = msg.encryption_info
         return self.container
 
 
@@ -295,6 +326,9 @@ class MimeSigningWrapper(MimeWrapper):
                       "attachment; filename=\"signature.asc\"")):
             self.sigblock.add_header(h, v)
 
+    def _update_crypto_status(self, part):
+        part.signature_info.part_status = 'verified'
+
     def wrap(self, msg, prefer_inline=False):
         from_key = self.get_keys([self.sender])[0]
 
@@ -303,27 +337,29 @@ class MimeSigningWrapper(MimeWrapper):
 
         if prefer_inline is not False:
             message_text = Normalize(prefer_inline.get_payload(None, True)
-                                     .strip() + '\n\n')
+                                     .strip() + '\r\n\r\n')
             status, sig = self.crypto().sign(message_text,
                                              fromkey=from_key,
                                              clearsign=True,
                                              armor=True)
             if status == 0:
                 _update_text_payload(prefer_inline, sig)
+                self._update_crypto_status(prefer_inline)
                 return msg
 
         else:
             MimeWrapper.wrap(self, msg)
             self.attach(msg)
             self.attach(self.sigblock)
-            message_text = Normalize(self.flatten(msg))
+            message_text = self.flatten(msg)
             status, sig = self.crypto().sign(message_text,
                                              fromkey=from_key, armor=True)
             if status == 0:
                 self.sigblock.set_payload(sig)
+                self._update_crypto_status(self.container)
                 return self.container
 
-        raise SignatureFailureError(_('Failed to sign message!'))
+        raise SignatureFailureError(_('Failed to sign message!'), from_key)
 
 
 class MimeEncryptingWrapper(MimeWrapper):
@@ -352,6 +388,9 @@ class MimeEncryptingWrapper(MimeWrapper):
         return self.crypto().encrypt(message_text,
                                      tokeys=tokeys, armor=True)
 
+    def _update_crypto_status(self, part):
+        part.encryption_info.part_status = 'decrypted'
+
     def wrap(self, msg, prefer_inline=False):
         to_keys = set(self.get_keys(self.recipients + [self.sender]))
 
@@ -365,6 +404,7 @@ class MimeEncryptingWrapper(MimeWrapper):
                                         armor=True)
             if status == 0:
                 _update_text_payload(prefer_inline, enc)
+                self._update_crypto_status(prefer_inline)
                 return msg
 
         else:
@@ -372,12 +412,13 @@ class MimeEncryptingWrapper(MimeWrapper):
             del msg['MIME-Version']
             if self.cleaner:
                 self.cleaner(msg)
-            message_text = Normalize(self.flatten(msg))
+            message_text = self.flatten(msg)
             status, enc = self._encrypt(message_text,
                                         tokeys=to_keys,
                                         armor=True)
             if status == 0:
                 self.enc_data.set_payload(enc)
+                self._update_crypto_status(self.enc_data)
                 return self.container
 
-        raise EncryptionFailureError(_('Failed to encrypt message!'))
+        raise EncryptionFailureError(_('Failed to encrypt message!'), to_keys)

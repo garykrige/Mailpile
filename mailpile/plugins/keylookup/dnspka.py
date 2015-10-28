@@ -5,6 +5,7 @@ except:
 
 import urllib2
 
+from mailpile.conn_brokers import Master as ConnBroker
 from mailpile.i18n import gettext
 from mailpile.plugins.keylookup import LookupHandler
 from mailpile.plugins.keylookup import register_crypto_key_lookup_handler
@@ -29,9 +30,9 @@ class DNSPKALookupHandler(LookupHandler):
         self.req = DNS.Request(qtype="TXT")
 
     def _score(self, key):
-        return (9, _('Found key in DNSPKA'))
+        return (9, _('Found key in DNS PKA'))
 
-    def _lookup(self, address):
+    def _lookup(self, address, strict_email_match=True):
         """
         >>> from mailpile.crypto.dnspka import *
         >>> d = DNSPKALookup()
@@ -42,7 +43,7 @@ class DNSPKALookupHandler(LookupHandler):
             return {}
         dom = address.replace("@", "._pka.")
         result = self.req.req(dom)
-        for res in result.answers:
+        for res in (result.answers if result else []):
             if res["typename"] != "TXT":
                 continue
             for entry in res["data"]:
@@ -73,7 +74,8 @@ class DNSPKALookupHandler(LookupHandler):
         if key["fingerprint"] and not key["url"]:
             res = self._gnupg().recv_key(key["fingerprint"])
         elif key["url"]:
-            r = urllib2.urlopen(key["url"])
+            with ConnBroker.context(need=[ConnBroker.OUTGOING_HTTP]):
+                r = urllib2.urlopen(key["url"])
             result = r.readlines()
             start = 0
             end = len(result)

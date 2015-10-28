@@ -5,8 +5,10 @@ import os.path
 import re
 import traceback
 
+import mailpile.security as security
 from mailpile.commands import Command
 from mailpile.crypto.state import *
+from mailpile.crypto.mime import EncryptionFailureError, SignatureFailureError
 from mailpile.eventlog import Event
 from mailpile.i18n import gettext as _
 from mailpile.i18n import ngettext as _n
@@ -15,8 +17,8 @@ from mailpile.plugins.tags import Tag
 from mailpile.mailutils import ExtractEmails, ExtractEmailAndName, Email
 from mailpile.mailutils import NotEditableError, AddressHeaderParser
 from mailpile.mailutils import NoFromAddressError, PrepareMessage
-from mailpile.smtp_client import SendMail
 from mailpile.search import MailIndex
+from mailpile.smtp_client import SendMail
 from mailpile.urlmap import UrlMap
 from mailpile.util import *
 from mailpile.vcard import AddressInfo
@@ -43,7 +45,8 @@ class EditableSearchResults(SearchResults):
 
 def AddComposeMethods(cls):
     class newcls(cls):
-        WITH_CONTEXT = (GLOBAL_EDITING_LOCK, )
+        COMMAND_CACHE_TTL = 0
+        COMMAND_SECURITY = security.CC_COMPOSE_EMAIL
 
         def _create_contacts(self, emails):
             try:
@@ -155,9 +158,11 @@ class CompositionCommand(AddComposeMethods(Search)):
         'body': '..',
         'encryption': '..',
         'attachment': '..',
+        'attach-pgp-pubkey': '..',
     }
 
-    UPDATE_HEADERS = ('Subject', 'From', 'To', 'Cc', 'Bcc', 'Encryption')
+    UPDATE_HEADERS = ('Subject', 'From', 'To', 'Cc', 'Bcc', 'Encryption',
+                      'Attach-PGP-Pubkey')
 
     def _new_msgid(self):
         msgid = (email.utils.make_msgid('mailpile')
@@ -294,15 +299,16 @@ class Draft(AddComposeMethods(View)):
 
     def _side_effects(self, emails):
         session, idx = self.session, self._idx()
-        if not emails:
-            session.ui.mark(_('No messages!'))
-        elif session.ui.edit_messages(session, emails):
-            self._tag_blank(emails, untag=True)
-            self._tag_drafts(emails)
-            self._background_save(index=True)
-            self.message = _('%d message(s) edited') % len(emails)
-        else:
-            self.message = _('%d message(s) unchanged') % len(emails)
+        with GLOBAL_EDITING_LOCK:
+            if not emails:
+                session.ui.mark(_('No messages!'))
+            elif session.ui.edit_messages(session, emails):
+                self._tag_blank(emails, untag=True)
+                self._tag_drafts(emails)
+                self._background_save(index=True)
+                self.message = _('%d message(s) edited') % len(emails)
+            else:
+                self.message = _('%d message(s) unchanged') % len(emails)
         session.ui.mark(self.message)
         return None
 
@@ -361,13 +367,26 @@ class Compose(CompositionCommand):
         if update_string:
             email.update_from_string(session, update_string)
 
-        return self._edit_messages([email], ephemeral=ephemeral, new=True)
+        return self._edit_messages([email],
+                                   ephemeral=ephemeral,
+                                   new=(ephemeral or not update_string))
 
 
 class RelativeCompose(Compose):
     _ATT_MIMETYPES = ('application/pgp-signature', )
     _TEXT_PARTTYPES = ('text', 'quote', 'pgpsignedtext', 'pgpsecuretext',
                        'pgpverifiedtext')
+
+    _FW_REGEXP = re.compile(r'^(fwd|fw):.*', re.IGNORECASE)
+    _RE_REGEXP = re.compile(r'^(rep|re):.*', re.IGNORECASE)
+
+    @staticmethod
+    def prefix_subject(subject, prefix, prefix_regex):
+        """Avoids stacking several consecutive Fw: Re: Re: Re:"""
+        if prefix_regex.match(subject):
+            return subject
+        else:
+            return '%s %s' % (prefix, subject)
 
 
 class Reply(RelativeCompose):
@@ -425,7 +444,8 @@ class Reply(RelativeCompose):
                                             force_name=True)
 
         def addresses(addrs, exclude=[]):
-            alist = [from_ai.address] + [a.address for a in exclude]
+            alist = [from_ai.address] if (from_ai) else []
+            alist += [a.address for a in exclude]
             return [merge_contact(a) for a in addrs
                     if a.address not in alist
                     and not a.address.startswith('noreply@')
@@ -433,8 +453,9 @@ class Reply(RelativeCompose):
 
         # If only replying to messages sent from chosen from, then this is
         # a follow-up or clarification, so just use the same headers.
-        if len([e for e in ref_from if e.address == from_ai.address]
-               ) == len(ref_from):
+        if (from_ai and
+               len([e for e in ref_from
+                    if e and e.address == from_ai.address]) == len(ref_from)):
             if ref_to:
                 result['to'] = addresses(ref_to)
             if ref_cc:
@@ -468,8 +489,11 @@ class Reply(RelativeCompose):
                               if p['type'] in cls._TEXT_PARTTYPES
                               and p['data']])
             if quoted:
+                target_width = session.config.prefs.line_length
+                if target_width > 40:
+                    quoted = reflow_text(quoted, target_width=target_width-2)
                 text = ((_('%s wrote:') % t['headers_lc']['from']) + '\n' +
-                        split_long_lines(quoted))
+                        quoted)
                 msg_bodies.append('\n\n' + text.replace('\n', '\n> '))
 
         if not ephemeral:
@@ -494,7 +518,8 @@ class Reply(RelativeCompose):
 
         return (Email.Create(idx, local_id, lmbox,
                              msg_text='\n\n'.join(msg_bodies),
-                             msg_subject=('Re: %s' % ref_subjs[-1]),
+                             msg_subject=cls.prefix_subject(
+                                 ref_subjs[-1], 'Re:', cls._RE_REGEXP),
                              msg_from=headers.get('from', None),
                              msg_to=headers.get('to', []),
                              msg_cc=headers.get('cc', []),
@@ -506,7 +531,6 @@ class Reply(RelativeCompose):
 
     def command(self):
         session, config, idx = self.session, self.session.config, self._idx()
-
         reply_all = False
         ephemeral = False
         args = list(self.args)
@@ -597,7 +621,8 @@ class Forward(RelativeCompose):
 
         email = Email.Create(idx, local_id, lmbox,
                              msg_text='\n\n'.join(msg_bodies),
-                             msg_subject=('Fwd: %s' % ref_subjs[-1]),
+                             msg_subject=cls.prefix_subject(
+                                 ref_subjs[-1], 'Fwd:', cls._FW_REGEXP),
                              msg_id=msgid,
                              msg_atts=msg_atts,
                              save=(not ephemeral),
@@ -650,6 +675,7 @@ class Attach(CompositionCommand):
     """Attach a file to a message"""
     SYNOPSIS = ('a', 'attach', 'message/attach', '<messages> [<path/to/file>]')
     ORDER = ('Composing', 2)
+    WITH_CONTEXT = (GLOBAL_EDITING_LOCK, )
     HTTP_CALLABLE = ('POST', 'UPDATE')
     HTTP_QUERY_VARS = {}
     HTTP_POST_VARS = {
@@ -673,10 +699,12 @@ class Attach(CompositionCommand):
                 files.append(fn)
                 count += 1
         else:
+            if args:
+                fb = security.forbid_command(self,
+                                             security.CC_ACCESS_FILESYSTEM)
+                if fb:
+                    return self._error(fb)
             while os.path.exists(args[-1]):
-                # Attaching from the local filesystem is scary!
-                if self.session.config.sys.lockdown:
-                    return self._error(_('In lockdown, doing nothing.'))
                 files.append(args.pop(-1))
 
         if not files:
@@ -699,6 +727,8 @@ class Attach(CompositionCommand):
             try:
                 email.add_attachments(session, files, filedata=filedata)
                 updated.append(email)
+            except KeyboardInterrupt:
+                raise
             except NotEditableError:
                 err(_('Read-only message: %s') % subject)
             except:
@@ -717,6 +747,69 @@ class Attach(CompositionCommand):
                                            expand=updated, error=errors)
 
 
+class UnAttach(CompositionCommand):
+    """Remove an attachment from a message"""
+    SYNOPSIS = (None, 'unattach', 'message/unattach', '<mid> <atts>')
+    ORDER = ('Composing', 2)
+    WITH_CONTEXT = (GLOBAL_EDITING_LOCK, )
+    HTTP_CALLABLE = ('POST', 'UPDATE')
+    HTTP_QUERY_VARS = {}
+    HTTP_POST_VARS = {
+        'mid': 'metadata-ID',
+        'att': 'Attachment IDs or filename'
+    }
+
+    def command(self, emails=None):
+        session, idx = self.session, self._idx()
+        args = list(self.args)
+        atts = []
+
+        if '--' in args:
+            atts = args[args.index('--') + 1:]
+            args = args[:args.index('--')]
+        elif args:
+            atts = [args.pop(-1)]
+        atts.extend(self.data.get('att', []))
+
+        if not emails:
+            args.extend(['=%s' % mid for mid in self.data.get('mid', [])])
+            emails = [self._actualize_ephemeral(i) for i in
+                      self._choose_messages(args, allow_ephemeral=True)]
+        if not emails:
+            return self._error(_('No messages selected'))
+
+        updated = []
+        errors = []
+        def err(msg):
+            errors.append(msg)
+            session.ui.error(msg)
+
+        for email in emails:
+            subject = email.get_msg_info(MailIndex.MSG_SUBJECT)
+            try:
+                email.remove_attachments(session, *atts)
+                updated.append(email)
+            except KeyboardInterrupt:
+                raise
+            except NotEditableError:
+                err(_('Read-only message: %s') % subject)
+            except:
+                err(_('Error removing from %s') % subject)
+                self._ignore_exception()
+
+        if errors:
+            self.message = _('Removed %s from %d messages, failed %d'
+                             ) % (', '.join(atts), len(updated), len(errors))
+        else:
+            self.message = _('Removed %s from %d messages'
+                             ) % (', '.join(atts), len(updated))
+
+        session.ui.notify(self.message)
+        return self._return_search_results(self.message, updated,
+                                           expand=updated, error=errors)
+
+
+
 class Sendit(CompositionCommand):
     """Mail/bounce a message (to someone)"""
     SYNOPSIS = (None, 'bounce', 'message/send', '<messages> [<emails>]')
@@ -725,7 +818,8 @@ class Sendit(CompositionCommand):
     HTTP_QUERY_VARS = {}
     HTTP_POST_VARS = {
         'mid': 'metadata-ID',
-        'to': 'recipients'
+        'to': 'recipients',
+        'from': 'sender e-mail'
     }
 
     # We set our events' source class explicitly, so subclasses don't
@@ -736,9 +830,6 @@ class Sendit(CompositionCommand):
         session, config, idx = self.session, self.session.config, self._idx()
         args = list(self.args)
 
-        if self.session.config.sys.lockdown:
-            return self._error(_('In lockdown, doing nothing.'))
-
         bounce_to = []
         while args and '@' in args[-1]:
             bounce_to.append(args.pop(-1))
@@ -747,14 +838,25 @@ class Sendit(CompositionCommand):
                      self.data.get('bcc', [])):
             bounce_to.extend(ExtractEmails(rcpt))
 
+        sender = self.data.get('from', [None])[0]
+        if not sender and bounce_to:
+            sender = idx.config.get_profile().get('email', None)
+
         if not emails:
             args.extend(['=%s' % mid for mid in self.data.get('mid', [])])
-            mids = self._choose_messages(args)
-            emails = [Email(idx, i) for i in mids]
+            emails = [self._actualize_ephemeral(i) for i in
+                      self._choose_messages(args, allow_ephemeral=True)]
+
+        # First make sure the draft tags are all gone, so other edits either
+        # fail or complete while we wait for the lock.
+        with GLOBAL_EDITING_LOCK:
+            self._tag_drafts(emails, untag=True)
+            self._tag_blank(emails, untag=True)
 
         # Process one at a time so we don't eat too much memory
         sent = []
         missing_keys = []
+        locked_keys = []
         for email in emails:
             events = []
             try:
@@ -781,27 +883,43 @@ class Sendit(CompositionCommand):
                         data={'mid': msg_mid, 'sid': msg_sid}))
 
                 SendMail(session, msg_mid,
-                         [PrepareMessage(config, email.get_msg(pgpmime=False),
+                         [PrepareMessage(config,
+                                         email.get_msg(pgpmime=False),
+                                         sender=sender,
                                          rcpts=(bounce_to or None),
+                                         bounce=(True if bounce_to else False),
                                          events=events)])
                 for ev in events:
                     ev.flags = Event.COMPLETE
                     config.event_log.log_event(ev)
                 sent.append(email)
-            except KeyLookupError, kle:
-                # This is fatal, we don't retry
-                message = _('Missing keys %s') % kle.missing
+
+            # Encryption related failures are fatal, don't retry
+            except (KeyLookupError,
+                    EncryptionFailureError,
+                    SignatureFailureError), exc:
+                message = unicode(exc)
+                session.ui.warning(message)
+                if hasattr(exc, 'missing_keys'):
+                    missing_keys.extend(exc.missing)
+                if hasattr(exc, 'from_key'):
+                    # FIXME: We assume signature failures happen because
+                    # the key is locked. Are there any other reasons?
+                    locked_keys.append(exc.from_key)
                 for ev in events:
                     ev.flags = Event.COMPLETE
                     ev.message = message
                     config.event_log.log_event(ev)
-                session.ui.warning(message)
-                missing_keys.extend(kle.missing)
                 self._ignore_exception()
+
             # FIXME: Also fatal, when the SMTP server REJECTS the mail
             except:
                 # We want to try that again!
-                message = _('Failed to send %s') % email
+                to = email.get_msg().get('x-mp-internal-rcpts').split(',')[0]
+                if to:
+                    message = _('Could not send mail to %s') % to
+                else:
+                    message = _('Could not send mail')
                 for ev in events:
                     ev.flags = Event.INCOMPLETE
                     ev.message = message
@@ -816,11 +934,11 @@ class Sendit(CompositionCommand):
 
         if missing_keys:
             self.error_info['missing_keys'] = missing_keys
+        if locked_keys:
+            self.error_info['locked_keys'] = locked_keys
         if sent:
             self._tag_sent(sent)
             self._tag_outbox(sent, untag=True)
-            self._tag_drafts(sent, untag=True)
-            self._tag_blank(sent, untag=True)
             for email in sent:
                 email.reset_caches()
                 idx.index_email(self.session, email)
@@ -833,8 +951,9 @@ class Sendit(CompositionCommand):
 
 class Update(CompositionCommand):
     """Update message from a file or HTTP upload."""
-    SYNOPSIS = ('u', 'update', 'message/update', '<messages> <<filename>')
+    SYNOPSIS = (None, 'update', 'message/update', '<messages> <<filename>')
     ORDER = ('Composing', 1)
+    WITH_CONTEXT = (GLOBAL_EDITING_LOCK, )
     HTTP_CALLABLE = ('POST', 'UPDATE')
     HTTP_POST_VARS = dict_merge(CompositionCommand.UPDATE_STRING_DATA,
                                 Attach.HTTP_POST_VARS)
@@ -871,6 +990,24 @@ class Update(CompositionCommand):
         except KeyLookupError, kle:
             return self._error(_('Missing encryption keys'),
                                info={'missing_keys': kle.missing})
+        except EncryptionFailureError, efe:
+            # This should never happen, should have been prevented at key
+            # lookup!
+            return self._error(_('Could not encrypt message'),
+                               info={'to_keys': efe.to_keys})
+        except SignatureFailureError, sfe:
+            # FIXME: We assume signature failures happen because
+            # the key is locked. Are there any other reasons?
+            return self._error(_('Could not sign message'),
+                               info={'locked_keys': [sfe.from_key]})
+
+
+class UpdateAndSendit(Update):
+    """Update message from an HTTP upload and move to outbox."""
+    SYNOPSIS = ('m', 'mail', 'message/update/send', None)
+
+    def command(self, create=True, outbox=True):
+        return Update.command(self, create=create, outbox=outbox)
 
 
 class UnThread(CompositionCommand):
@@ -886,23 +1023,16 @@ class UnThread(CompositionCommand):
         args = list(self.args)
         for mid in self.data.get('mid', []):
             args.append('=%s' % mid)
-        emails = [Email(idx, mid) for mid in self._choose_messages(args)]
+        emails = [self._actualize_ephemeral(i) for i in
+                  self._choose_messages(args, allow_ephemeral=True)]
 
         if emails:
             for email in emails:
                 idx.unthread_message(email.msg_mid())
             return self._return_search_results(
-                _('Unthreaded %d messaages') % len(emails), emails)
+                _('Unthreaded %d messages') % len(emails), emails)
         else:
             return self._error(_('Nothing to do!'))
-
-
-class UpdateAndSendit(Update):
-    """Update message from an HTTP upload and move to outbox."""
-    SYNOPSIS = ('m', 'mail', 'message/update/send', None)
-
-    def command(self, create=True, outbox=True):
-        return Update.command(self, create=create, outbox=outbox)
 
 
 class EmptyOutbox(Sendit):
@@ -919,14 +1049,27 @@ class EmptyOutbox(Sendit):
         if not idx:
             return self._error(_('The index is not ready yet'))
 
+        # Collect a list of messages from the outbox
         messages = []
         for tag in cfg.get_tags(type='outbox'):
             search = ['in:%s' % tag._key]
             for msg_idx_pos in idx.search(self.session, search,
                                           order='flat-index').as_set():
                 messages.append('=%s' % b36(msg_idx_pos))
+
+        # Messages no longer in the outbox get their events canceled...
+        if cfg.event_log:
+            events = cfg.event_log.incomplete(source='.plugins.compose.Sendit')
+            for ev in events:
+                if ('mid' in ev.data and
+                        ('=%s' % ev.data['mid']) not in messages):
+                    ev.flags = ev.COMPLETE
+                    ev.message = _('Sending cancelled.')
+                    cfg.event_log.log_event(ev)
+
+        # Send all the mail!
         if messages:
-            self.args = tuple(messages)
+            self.args = tuple(set(messages))
             return Sendit.command(self)
         else:
             return self._success(_('The outbox is empty'))
@@ -939,8 +1082,8 @@ _plugins.register_config_variables('prefs', {
 _plugins.register_slow_periodic_job('sendmail',
                                     'prefs.empty_outbox_interval',
                                     EmptyOutbox.sendmail)
-_plugins.register_commands(Compose, Reply, Forward,  # Create
-                           Draft, Update, Attach,    # Manipulate
-                           UnThread,                 # ...
-                           Sendit, UpdateAndSendit,  # Send
-                           EmptyOutbox)              # ...
+_plugins.register_commands(Compose, Reply, Forward,           # Create
+                           Draft, Update, Attach, UnAttach,   # Manipulate
+                           UnThread,                          # ...
+                           Sendit, UpdateAndSendit,           # Send
+                           EmptyOutbox)                       # ...

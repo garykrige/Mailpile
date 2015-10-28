@@ -1,4 +1,5 @@
 import threading
+import traceback
 import time
 
 import mailpile.util
@@ -90,8 +91,9 @@ class Cron(threading.Thread):
         Thread main function for a Cron instance.
 
         """
-        self.ALIVE = True
         # Main thread loop
+        with self.session.config.index_check:
+            self.ALIVE = True
         while self.ALIVE and not mailpile.util.QUITTING:
             tasksToBeExecuted = []  # Contains tuples (name, func)
             now = time.time()
@@ -153,12 +155,15 @@ class Cron(threading.Thread):
 
 class Worker(threading.Thread):
 
+    PAUSE_DEADLINE = 2
+
     def __init__(self, name, session, daemon=False):
         threading.Thread.__init__(self)
         self.daemon = mailpile.util.TESTING or daemon
         self.name = name or 'Worker'
         self.ALIVE = False
         self.JOBS = []
+        self.JOBS_LATER = []
         self.LOCK = threading.Condition(WorkerRLock())
         self.last_run = time.time()
         self.running = 'Idle'
@@ -167,23 +172,36 @@ class Worker(threading.Thread):
         self.important = False
 
     def __str__(self):
-        return ('%s: %s (%ds, jobs=%s)'
+        return ('%s: %s (%ds, jobs=%s, jobs_after=%s)'
                 % (threading.Thread.__str__(self),
                    self.running,
                    time.time() - self.last_run,
-                   len(self.JOBS)))
+                   len(self.JOBS), len(self.JOBS_LATER)))
 
-    def add_task(self, session, name, task, unique=False):
+    def add_task(self, session, name, task,
+                 after=None, unique=False, first=False):
         with self.LOCK:
             if unique:
                 for s, n, t in self.JOBS:
                     if n == name:
                         return
-            self.JOBS.append((session, name, task))
+            if unique and after:
+                for ts, (s, n, t) in self.JOBS_LATER:
+                    if n == name:
+                        return
+
+            snt = (session, name, task)
+            if first:
+                self.JOBS[:0] = [snt]
+            elif after:
+                self.JOBS_LATER.append((after, snt))
+            else:
+                self.JOBS.append(snt)
+
             self.LOCK.notify()
 
-    def add_unique_task(self, session, name, task):
-        return self.add_task(session, name, task, unique=True)
+    def add_unique_task(self, session, name, task, **kwargs):
+        return self.add_task(session, name, task, unique=True, **kwargs)
 
     def do(self, session, name, task, unique=False):
         if session and session.main:
@@ -202,17 +220,18 @@ class Worker(threading.Thread):
                 rv = True
         return rv
 
+    def _pause_for_user_activities(self):
+        play_nice_with_threads(deadline=time.time() + self.PAUSE_DEADLINE)
+
     def _keep_running(self, **ignored_kwargs):
         return (self.ALIVE and not mailpile.util.QUITTING)
 
     def _failed(self, session, name, task, e):
+        self.session.ui.debug(traceback.format_exc())
         self.session.ui.error(('%s failed in %s: %s'
                                ) % (name, self.name, e))
         if session:
             session.report_task_failed(name)
-
-    def _play_nice_with_threads(self):
-        play_nice_with_threads()
 
     def run(self):
         self.ALIVE = True
@@ -223,9 +242,16 @@ class Worker(threading.Thread):
                         return
                     self.LOCK.wait()
 
-            self._play_nice_with_threads()
             with self.LOCK:
                 session, name, task = self.JOBS.pop(0)
+                if len(self.JOBS) < 0:
+                    now = time.time()
+                    self.JOBS.extend(snt for ts, snt
+                                     in self.JOBS_LATER if ts <= now)
+                    self.JOBS_LATER = [(ts, snt) for ts, snt
+                                       in self.JOBS_LATER if ts > now]
+
+            self._pause_for_user_activities()
             try:
                 self.last_run = time.time()
                 self.running = name
@@ -234,6 +260,10 @@ class Worker(threading.Thread):
                     session.report_task_completed(name, task())
                 else:
                     task()
+            except (JobPostponingException), e:
+                session.ui.debug('Postponing: %s' % name)
+                self.add_task(session, name, task,
+                              after=time.time() + e.seconds)
             except (IOError, OSError), e:
                 self._failed(session, name, task, e)
                 time.sleep(1)
@@ -277,6 +307,14 @@ class Worker(threading.Thread):
 
 
 class ImportantWorker(Worker):
+
+    PAUSE_DEADLINE = 0.5
+
+    def _pause_for_user_activities(self):
+        # Our jobs are important, if we have too many we stop playing nice
+        if len(self.JOBS) < 10:
+            Worker._pause_for_user_activities(self)
+
     def _keep_running(self, _pass=1, locked=False):
         # This is a much more careful shutdown test, that refuses to
         # stop with jobs queued up and tries to compensate for potential
@@ -304,11 +342,6 @@ class ImportantWorker(Worker):
         # Important jobs!  Re-queue if they fail, it might be transient
         Worker._failed(self, session, name, task, e)
         self.add_unique_task(session, name, task)
-
-    def _play_nice_with_threads(self):
-        # Our jobs are important, if we have too many we stop playing nice
-        if len(self.JOBS) < 10:
-            play_nice_with_threads()
 
 
 class DumbWorker(Worker):

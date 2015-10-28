@@ -1,0 +1,34 @@
+# This is a Mailpile plugin manifest, describing the `forcegrapher` plugin.
+{
+    "name": "forcegrapher",
+    "author": "The Mailpile Team <team@mailpile.is>",
+    "description": "Generates a simple force directed graph for a given search query",
+    "config": {},
+    "code": {
+        "python": ["forcegrapher.py"],
+        "javascript": ["forcegrapher.js", "d3.js"],
+        "css": ["forcegrapher.css"]
+    },
+    "routes": {
+        "/graph/": {"file": "forcegrapher.html", "api": 0}
+    },
+    "user_interface": {
+        "display_modes": [
+            {
+                "context": ["/search/"],
+                "name": "graph",
+                "text": "Graph",
+                "description": "Show contact relationships",
+                "icon": "force-graph",
+                "url": "/graph/"
+            }
+        ]
+    },
+    "commands": [
+        {
+            "class": "Graph",
+            "name": "graph",
+            "url": "graph"
+        }
+    ]
+}

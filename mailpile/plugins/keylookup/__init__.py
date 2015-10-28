@@ -6,7 +6,9 @@ from mailpile.i18n import gettext as _
 from mailpile.i18n import ngettext as _n
 from mailpile.mailutils import ClearParseCache
 from mailpile.plugins import PluginManager
+from mailpile.plugins.vcard_gnupg import PGPKeysImportAsVCards
 from mailpile.util import *
+from mailpile.vcard import AddressInfo
 
 
 __all__ = ['email_keylookup', 'nicknym', 'dnspka']
@@ -24,21 +26,24 @@ def register_crypto_key_lookup_handler(handler):
 
 def _score_validity(validity, local=False):
     if "r" in validity:
-        return (-1000, _('Key is revoked'))
+        return (-1000, _('Encryption key is revoked'))
     elif "d" in validity:
-        return (-1000, _('Key is disabled'))
+        return (-1000, _('Encryption key is disabled'))
     elif "e" in validity:
-        return (-100, _('Key has expired'))
+        return (-100, _('Encryption key has expired'))
     elif local and ("f" in validity or "u" in validity):
-        return (50, _('Key is trusted'))
+        return (50, _('Encryption key has been imported and verified'))
     return (0, '')
 
 
+# FIXME: https://leap.se/en/docs/design/transitional-key-validation
+#        ... provides a very structured ranking for keys coming from
+#        different types of sources.  Check it!
 def _update_scores(key_id, key_info, known_keys_list):
     """Update scores and score explanations"""
     key_info["score"] = sum([score for source, (score, reason)
                              in key_info.get('scores', {}).iteritems()
-                             if source != 'Known keys'])
+                             if source != 'Known encryption keys'])
 
     # This is done here, not on the keychain lookup handler, in case
     # for some reason (e.g. UID changes on source keys) remote sources
@@ -48,17 +53,27 @@ def _update_scores(key_id, key_info, known_keys_list):
                                         local=True)
         if score == 0:
             score += 9
-            reason = _('Key is on keychain')
+            reason = _('Encryption key has been imported')
 
         key_info["on_keychain"] = True
         key_info['score'] += score
-        key_info['scores']['Known keys'] = [score, reason]
+        key_info['scores']['Known encryption keys'] = [score, reason]
 
     if "keysize" in key_info:
         bits = int(key_info["keysize"])
         score = bits // 1024
         key_info['score'] += score
-        key_info['scores']['Key size'] = [score, _('Key is %d bits') % bits]
+
+        if bits >= 4096: 
+          key_strength = _('Encryption key is very strong')
+        elif bits >= 3072: 
+          key_strength = _('Encryption key is strong')
+        elif bits >= 2048:
+          key_strength = _('Encryption key is average')
+        else: 
+          key_strength = _('Encryption key is weak')
+
+        key_info['scores']['Encryption key strength'] = [score, key_strength]
 
     sc, reason = max([(abs(score), reason)
                      for score, reason in key_info['scores'].values()])
@@ -69,14 +84,21 @@ def _update_scores(key_id, key_info, known_keys_list):
                                * (-1 if (key_info['score'] < 0) else 1))
 
 
-def _normalize_key(key_info):
+def _normalize_key(session, key_info):
     """Make sure expected attributes are on all keys"""
     if not key_info.get("uids"):
         key_info["uids"] = [{"name": "", "email": "", "comment": ""}]
+    if key_info.get("vcards") is None:
+        key_info["vcards"] = {}
     for uid in key_info["uids"]:
         uid["name"] = uid.get("name", _('Anonymous'))
-        uid["email"] = uid.get("email", '')
+        uid["email"] = e = uid.get("email", '')
         uid["comment"] = uid.get("comment", '')
+        if e and e not in key_info["vcards"]:
+            vcard = session.config.vcards.get_vcard(e)
+            if vcard:
+                ai = AddressInfo(e, uid["name"], vcard=vcard)
+                key_info["vcards"][e] = ai
     for key, default in [('on_keychain', False),
                          ('keysize', '0'),
                          ('keytype_name', 'unknown'),
@@ -88,7 +110,8 @@ def _normalize_key(key_info):
 
 
 def lookup_crypto_keys(session, address,
-                       event=None, allowremote=True, origins=None, get=None):
+                       event=None, strict_email_match=False, allowremote=True,
+                       origins=None, get=None):
     known_keys_list = GnuPG(session and session.config or None).list_keys()
     found_keys = {}
     ordered_keys = []
@@ -102,18 +125,19 @@ def lookup_crypto_keys(session, address,
             # We have all the keys!
             break
 
-        h = handler(session, known_keys_list)
-        if not allowremote and not h.LOCAL:
-            continue
-
-        if event:
-            ordered_keys.sort(key=lambda k: -k["score"])
-            event.message = _('Searching for keys in: %s') % _(h.NAME)
-            event.private_data = {"result": ordered_keys,
-                                  "runningsearch": h.NAME}
-            session.config.event_log.log_event(event)
-
         try:
+            h = handler(session, known_keys_list)
+            if not allowremote and not h.LOCAL:
+                continue
+
+            if event:
+                ordered_keys.sort(key=lambda k: -k["score"])
+                event.message = _('Searching for encryption keys in: %s'
+                                  ) % _(h.NAME)
+                event.private_data = {"result": ordered_keys,
+                                      "runningsearch": h.NAME}
+                session.config.event_log.log_event(event)
+
             # We allow for more time when importing keys
             timeout = h.TIMEOUT
             if ungotten:
@@ -122,9 +146,11 @@ def lookup_crypto_keys(session, address,
             # h.lookup will remove found keys from the wanted list,
             # but we have to watch out for the effects of timeouts.
             wanted = ungotten[:]
-            results = RunTimed(timeout, h.lookup, address, get=wanted)
+            results = RunTimed(timeout, h.lookup, address,
+                               strict_email_match=strict_email_match,
+                               get=(wanted if (get is not None) else None))
             ungotten[:] = wanted
-        except (TimedOut, IOError, ValueError):
+        except (TimedOut, IOError, ValueError, TypeError, AttributeError):
             if session.config.sys.debug:
                 traceback.print_exc()
             results = {}
@@ -151,7 +177,7 @@ def lookup_crypto_keys(session, address,
                 found_keys[key_id]["origins"] = []
             found_keys[key_id]["origins"].append(h.NAME)
             _update_scores(key_id, found_keys[key_id], known_keys_list)
-            _normalize_key(found_keys[key_id])
+            _normalize_key(session, found_keys[key_id])
 
         # This updates and sorts ordered_keys in place. This will magically
         # also update the data on the viewable event, because Python.
@@ -173,7 +199,8 @@ class KeyLookup(Command):
         '<address> [<allowremote>]')
     HTTP_CALLABLE = ('GET',)
     HTTP_QUERY_VARS = {
-        'address': 'The nick/address to find a key for',
+        'email': 'The address to find a encryption key for (strict)',
+        'address': 'The nick or address to find a encryption key for (fuzzy)',
         'allowremote': 'Whether to permit remote key lookups (defaults to true)'
     }
 
@@ -183,11 +210,15 @@ class KeyLookup(Command):
         else:
             allowremote = self.data.get('allowremote', True)
 
+        email = " ".join(self.data.get('email', []))
         address = " ".join(self.data.get('address', self.args))
-        result = lookup_crypto_keys(self.session, address, event=self.event,
+        result = lookup_crypto_keys(self.session, email or address,
+                                    strict_email_match=email,
+                                    event=self.event,
                                     allowremote=allowremote)
-        return self._success(_n('Found %d key', 'Found %d keys', len(result)
-                                ) % len(result),
+        return self._success(_n('Found %d encryption key',
+                                'Found %d encryption keys', 
+                                len(result)) % len(result),
                              result=result)
 
 
@@ -198,7 +229,7 @@ class KeyImport(Command):
                       '<address> <fingerprint,...> <origins ...>')
     HTTP_CALLABLE = ('POST',)
     HTTP_POST_VARS = {
-        'address': 'The nick/address to find a key for',
+        'address': 'The nick/address to find an encryption key for',
         'fingerprints': 'List of fingerprints we want',
         'origins': 'List of origins to search'
     }
@@ -218,11 +249,16 @@ class KeyImport(Command):
                                     origins=origins,
                                     event=self.event)
         if len(result) > 0:
+            # Update the VCards!
+            PGPKeysImportAsVCards(self.session,
+                                  arg=[k['fingerprint'] for k in result]
+                                  ).run()
             # Previous crypto evaluations may now be out of date, so we
             # clear the cache so users can see results right away.
             ClearParseCache(pgpmime=True)
 
-        return self._success(_n('Imported %d key', 'Imported %d keys',
+        return self._success(_n('Imported %d encryption key',
+                                'Imported %d encryption keys',
                                 len(result)) % len(result),
                              result=result)
 
@@ -252,18 +288,18 @@ class LookupHandler:
         raise NotImplemented("Subclass and override _getkey")
 
     def _gk_succeeded(self, result):
-        return 0 < (len(result.get('imported', [])) +
-                    len(result.get('updated', [])))
+        return (result and 0 < (len(result.get('imported', [])) +
+                                len(result.get('updated', []))))
 
-    def _lookup(self, address):
+    def _lookup(self, address, strict_email_match=False):
         raise NotImplemented("Subclass and override _lookup")
 
-    def lookup(self, address, get=None):
-        all_keys = self._lookup(address)
+    def lookup(self, address, strict_email_match=False, get=None):
+        all_keys = self._lookup(address, strict_email_match=strict_email_match)
         keys = {}
         for key_id, key_info in all_keys.iteritems():
             fprint = key_info.get('fingerprint', '')
-            if (not get) or fprint in get:
+            if (get is None) or (fprint and fprint in get):
 
                 score, reason = self._score(key_info)
                 if 'validity' in key_info:
@@ -276,7 +312,7 @@ class LookupHandler:
                 key_info['scores'] = {
                     self.NAME: [score, reason]
                 }
-                if get:
+                if get is not None:
                     get.remove(fprint)
                     if self._gk_succeeded(self._getkey(key_info)):
                         keys[key_id] = key_info
@@ -295,18 +331,22 @@ class KeychainLookupHandler(LookupHandler):
     PRIORITY = 0
 
     def _score(self, key):
-        return (1, _('Found key in keychain'))
+        return (1, _('Found encryption key in keychain'))
 
     def _getkey(self, key):
         return False  # Already on keychain
 
-    def _lookup(self, address):
+    def _lookup(self, address, strict_email_match):
         address = address.lower()
         results = {}
         for key_id, key_info in self.known_keys.iteritems():
             for uid in key_info.get('uids', []):
-                if (address in uid.get('name', '').lower() or
-                        address in uid.get('email', '').lower()):
+                if strict_email_match:
+                    match = (address in uid.get('name', '').lower() or
+                             address in uid.get('email', '').lower())
+                else:
+                    match = (address == uid.get('email', '').lower())
+                if match:
                     results[key_id] = {}
                     for k in ('created', 'fingerprint', 'keysize',
                               'key_name', 'uids'):
@@ -325,10 +365,17 @@ class KeyserverLookupHandler(LookupHandler):
     PRIORITY = 200
 
     def _score(self, key):
-        return (1, _('Found key in keyserver'))
+        return (1, _('Found encryption key in keyserver'))
 
-    def _lookup(self, address):
-        return self._gnupg().search_key(address)
+    def _lookup(self, address, strict_email_match=False):
+        results = self._gnupg().search_key(address)
+        if strict_email_match:
+            for key in results.keys():
+                match = [u for u in results[key].get('uids', [])
+                         if u['email'].lower() == address]
+                if not match:
+                    del results[key]
+        return results
 
     def _getkey(self, key):
         return self._gnupg().recv_key(key['fingerprint'])

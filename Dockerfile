@@ -1,23 +1,35 @@
 FROM ubuntu:14.04
 
-# Update packages lists
-RUN apt-get update -y
-
-# Force -y for apt-get
-RUN echo "APT::Get::Assume-Yes true;" >>/etc/apt/apt.conf
-
-# Add code & install the requirements
-RUN apt-get install make python-pip && apt-get clean
-ADD Makefile /Mailpile/Makefile
-WORKDIR /Mailpile
-RUN make debian-dev && apt-get clean
+# Install dependencies
+RUN apt-get update -y && \
+    apt-get install -y openssl python-imaging python-jinja2 python-lxml libxml2-dev libxslt1-dev python-pgpdump spambayes
 
 # Add code
+WORKDIR /Mailpile
 ADD . /Mailpile
 
-# Setup
+# Create users and groups
+RUN groupadd -r mailpile \
+    && mkdir -p /mailpile-data/.gnupg \
+    && useradd -r -d /mailpile-data -g mailpile mailpile
+
+# Add GnuPG placeholder file
+RUN touch /mailpile-data/.gnupg/docker_placeholder
+
+# Fix permissions
+RUN chown -R mailpile:mailpile /Mailpile
+RUN chown -R mailpile:mailpile /mailpile-data
+
+# Run as non-privileged user
+USER mailpile
+
+# Initialize mailpile
 RUN ./mp setup
 
-CMD /Mailpile/mp --www=0.0.0.0:33411 --wait
+# Entrypoint
+CMD ./mp --www=0.0.0.0:33411 --wait
 EXPOSE 33411
-VOLUME /.share/local/Mailpile
+
+# Volumes
+VOLUME /mailpile-data/.local/share/Mailpile
+VOLUME /mailpile-data/.gnupg

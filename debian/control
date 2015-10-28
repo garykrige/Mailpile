@@ -1,14 +1,20 @@
+# ------------------------------------------------------------------------- #
+# DEBIAN PACKAGE CONTROL FILE                                               #
+#                                                                           #
+# This file is a Debian control file. For more information on the config in #
+# this file, please run `man deb-control`.                                  #
+# ------------------------------------------------------------------------- #
+
 Source: mailpile
-Maintainer: Mailpile <team@mailpile.is>
 Section: mail
-Priority: optional
-Standards-Version: 3.9.2
-Build-Depends: debhelper (>= 8), python (>= 2.7), python-lxml (>= 2.3.2), python-imaging (>= 1.1.7), python-jinja2, node-less, python-setuptools, python-nose
-X-Python-Version: >= 2.6
+Priority: extra
+Maintainer: Bjarni R Einarrson <bre@mailpile.is>
+Build-Depends: debhelper (>= 9), python, python-setuptools, dh-virtualenv (>> 0.6), tar, python-dev, libxml2-dev, libxslt-dev, libz-dev
+Standards-Version: 3.9.5
+Homepage: https://www.mailpile.is
 
 Package: mailpile
-Architecture: all
-Depends: ${python:Depends}, ${misc:Depends}, python-lxml (>= 2.3.2), python-imaging (>= 1.1.7), python-jinja2, spambayes (>= 1.1b), spambayes (<< 1.1c~)
-Recommends: gnupg
-Homepage: http://www.mailpile.is
-Description: Local mail container with a web-mail interface, and encryption.
+Architecture: any
+Depends: gnupg, openssl
+Pre-Depends: dpkg (>= 1.16.1), python
+Description: Mailpile: email that protects your privacy

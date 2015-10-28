@@ -15,6 +15,7 @@ from mailpile.util import safe_remove
 class MailpileMailbox(UnorderedPicklable(mailbox.Maildir, editable=True)):
     """A Maildir class that supports pickling and a few mailpile specifics."""
     supported_platform = None
+    colon = '!'  # Works on both Windows and Unix
 
     @classmethod
     def parse_path(cls, config, fn, create=False):
@@ -25,45 +26,72 @@ class MailpileMailbox(UnorderedPicklable(mailbox.Maildir, editable=True)):
                   os.path.exists(os.path.join(fn, 'wervd.ver'))) or
                  (create and not os.path.exists(fn)))):
             return (fn, )
-        raise ValueError('Not a Maildir: %s' % fn)
+        raise ValueError('Not a Mailpile Maildir: %s' % fn)
 
     def __init2__(self, *args, **kwargs):
         open(os.path.join(self._path, 'wervd.ver'), 'w+b').write('0')
 
     def remove(self, key):
         # FIXME: Remove all the copies of this message!
-        fn = self._lookup(key)
-        del self._toc[key]
+        with self._lock:
+            fn = os.path.join(self._path, self._lookup(key))
+            del self._toc[key]
         safe_remove(fn)
 
     def _refresh(self):
-        mailbox.Maildir._refresh(self)
-        # WERVD mail names don't have dots in them
-        for t in [k for k in self._toc.keys() if '.' in k]:
-            del self._toc[t]
+        with self._lock:
+            mailbox.Maildir._refresh(self)
+            # WERVD mail names don't have dots in them
+            for t in [k for k in self._toc.keys() if '.' in k]:
+                del self._toc[t]
         safe_remove()  # Try to remove any postponed removals
 
     def _get_fd(self, key):
-        fd = open(os.path.join(self._path, self._lookup(key)), 'rb')
-        key = self._decryption_key_func()
-        if key:
-            fd = DecryptingStreamer(fd, mep_key=key, name='WERVD')
+        with self._lock:
+            fd = open(os.path.join(self._path, self._lookup(key)), 'rb')
+            mep_key = self._decryption_key_func()
+        if mep_key:
+            fd = DecryptingStreamer(fd, mep_key=mep_key, name='WERVD')
         return fd
 
     def get_message(self, key):
         """Return a Message representation or raise a KeyError."""
-        with self._get_fd(key) as fd:
-            if self._factory:
-                return self._factory(fd)
-            else:
-                return mailbox.MaildirMessage(fd)
+        with self._lock:
+            with self._get_fd(key) as fd:
+                if self._factory:
+                    return self._factory(fd)
+                else:
+                    return mailbox.MaildirMessage(fd)
 
     def get_string(self, key):
-        with self._get_fd(key) as fd:
-            return fd.read()
+        with self._lock:
+            with self._get_fd(key) as fd:
+                return fd.read()
 
     def get_file(self, key):
-        return StringIO.StringIO(self.get_string(key))
+        with self._lock:
+            return StringIO.StringIO(self.get_string(key))
+
+    def get_metadata_keywords(self, toc_id):
+        subdir, name = os.path.split(self._lookup(toc_id))
+        if self.colon in name:
+            flags = name.split(self.colon)[-1]
+            if flags[:2] == '2,':
+                return ['%s:maildir' % c for c in flags[2:]]
+        return []
+
+    def set_metadata_keywords(self, toc_id, kws):
+        with self._lock:
+            old_fpath = self._lookup(toc_id)
+            new_fpath = old_fpath.rsplit(self.colon, 1)[0]
+
+            flags = ''.join(sorted([k[0] for k in kws]))
+            if flags:
+                new_fpath += '%s2,%s' % (self.colon, flags)
+                if new_fpath != old_fpath:
+                    os.rename(os.path.join(self._path, old_fpath),
+                              os.path.join(self._path, new_fpath))
+                    self._toc[toc_id] = new_fpath
 
     def add(self, message, copies=1):
         """Add message and return assigned key."""

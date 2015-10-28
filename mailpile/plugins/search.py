@@ -2,6 +2,7 @@ import datetime
 import re
 import time
 
+import mailpile.security as security
 from mailpile.commands import Command, SearchResults
 from mailpile.i18n import gettext as _
 from mailpile.i18n import ngettext as _n
@@ -12,6 +13,7 @@ from mailpile.search import MailIndex
 from mailpile.urlmap import UrlMap
 from mailpile.util import *
 from mailpile.ui import SuppressHtmlOutput
+from mailpile.vfs import vfs, FilePath
 
 
 _plugins = PluginManager(builtin=__file__)
@@ -30,9 +32,12 @@ class Search(Command):
         'order': 'sort order',
         'start': 'start position',
         'end': 'end position',
-        'full': 'return all metadata'
+        'full': 'return all metadata',
+        'context': 'refine or redisplay an older search'
     }
     IS_USER_ACTIVITY = True
+    COMMAND_CACHE_TTL = 3600
+    CHANGES_SESSION_CONTEXT = True
 
     class CommandResult(Command.CommandResult):
         def __init__(self, *args, **kwargs):
@@ -56,8 +61,9 @@ class Search(Command):
                     return unicode(self.result)
                 elif isinstance(self.result, (list, set)):
                     return '\n'.join([r.as_text() for r in self.result])
-                else:
+                elif hasattr(self.result, 'as_text'):
                     return self.result.as_text()
+                return _('Unprintable results')
             else:
                 return _('No results')
 
@@ -75,24 +81,43 @@ class Search(Command):
         except (AttributeError, NameError):
             return Command.state_as_query_args(self)
 
-    def _do_search(self, search=None):
+    def _starting(self):
+        Command._starting(self)
         session, idx = self.session, self._idx()
-        session.searched = search or []
-        args = list(self.args)
+        self._search_args = args = []
 
+        self.context = self.data.get('context', [None])[0]
+        if self.context:
+            args += self.session.searched
+
+        def nq(t):
+            p = t[0] if (t and t[0] in '-+') else ''
+            t = t[len(p):]
+            if t.startswith('tag:') or t.startswith('in:'):
+                try:
+                    raw_tag = session.config.get_tag(t.split(':')[1])
+                    if raw_tag and raw_tag.hasattr(slug):
+                        t = 'in:%s' % raw_tag.slug
+                except (IndexError, KeyError, TypeError):
+                    pass
+            return p+t
+
+
+        args += [a for a in list(nq(a) for a in self.args) if a not in args]
         for q in self.data.get('q', []):
-            args.extend(q.split())
+            ext = [nq(a) for a in q.split()]
+            args.extend([a for a in ext if a not in args])
 
         # Query refinements...
         qrs = []
         for qr in self.data.get('qr', []):
-            qrs.extend(qr.split())
+            qrs.extend(nq(a) for a in qr.split())
         args.extend(qrs)
 
         for order in self.data.get('order', []):
             session.order = order
 
-        num = session.config.prefs.num_results
+        num = def_num = session.config.prefs.num_results
         d_start = int(self.data.get('start', [0])[0])
         d_end = int(self.data.get('end', [0])[0])
         if d_start and d_end:
@@ -104,48 +129,87 @@ class Search(Command):
             args[:0] = ['@%s' % (d_end - num + 1)]
 
         start = 0
-        if args and args[0].startswith('@'):
+        while args and args[0].startswith('@'):
             spoint = args.pop(0)[1:]
             try:
                 start = int(spoint) - 1
             except ValueError:
                 raise UsageError(_('Weird starting point: %s') % spoint)
 
-        prefix = ''
-        for arg in args:
-            if arg.endswith(':'):
-                prefix = arg
-            elif ':' in arg or (arg and arg[0] in ('-', '+')):
-                prefix = ''
-                session.searched.append(arg.lower())
-            elif prefix and '@' in arg:
-                session.searched.append(prefix + arg.lower())
-            else:
-                words = re.findall(WORD_REGEXP, arg.lower())
-                session.searched.extend([prefix + word for word in words])
-
-        if not session.searched:
-             session.searched = ['all:mail']
-
         session.order = session.order or session.config.prefs.default_order
-        session.results = list(idx.search(session, session.searched).as_set())
-        idx.sort_results(session, session.results, session.order)
-
+        self._start = start
+        self._num = num
         self._search_state = {
-            'q': [a for a in args if not (a.startswith('@') or a in qrs)],
+            'q': [q for q in args if q not in qrs],
             'qr': qrs,
-            'start': [a for a in args if a.startswith('@')],
-            'order': [session.order]
+            'order': [session.order],
+            'start': [str(start + 1)] if start else [],
+            'end': [str(start + num)] if (num != def_num) else []
         }
-        return session, idx, start, num
+        if self.context:
+            self._search_state['context'] = [self.context]
 
-    def command(self, search=None):
-        session, idx, start, num = self._do_search(search=search)
+    def _do_search(self, search=None, process_args=False):
+        session, idx = self.session, self._idx()
+
+        if self.context is None or search or session.searched != self._search_args:
+            session.searched = search or []
+            if search is None or process_args:
+                prefix = ''
+                for arg in self._search_args:
+                    if arg.endswith(':'):
+                        prefix = arg
+                    elif ':' in arg or (arg and arg[0] in ('-', '+')):
+                        if not arg.startswith('vfs:'):
+                            arg = arg.lower()
+                        prefix = ''
+                        session.searched.append(arg)
+                    elif prefix and '@' in arg:
+                        session.searched.append(prefix + arg.lower())
+                    else:
+                        words = re.findall(WORD_REGEXP, arg.lower())
+                        session.searched.extend([prefix + word
+                                                 for word in words])
+            if not session.searched:
+                session.searched = ['all:mail']
+
+            context = session.results if self.context else None
+            session.results = list(idx.search(session, session.searched,
+                                              context=context).as_set())
+            if session.order:
+                idx.sort_results(session, session.results, session.order)
+
+        return session, idx
+
+    def cache_requirements(self, result):
+        msgs = self.session.results[self._start:self._start + self._num]
+        def fix_term(term):
+            # Terms are reversed in the search engine...
+            if term[:1] in ['-', '+']:
+                term = term[1:]
+            if term[:4] == 'vfs:':
+                raise ValueError('VFS searches are not cached')
+            term = ':'.join(reversed(term.split(':', 1)))
+            return unicode(term)
+        reqs = set(['!config'] +
+                   [fix_term(t) for t in self.session.searched] +
+                   [u'%s:msg' % i for i in msgs])
+        if self.session.displayed:
+            reqs |= set(u'%s:thread' % int(tmid, 36) for tmid in
+                        self.session.displayed.get('thread_ids', []))
+            reqs |= set(u'%s:msg' % int(tmid, 36) for tmid in
+                        self.session.displayed.get('message_ids', []))
+        return reqs
+
+    def command(self):
+        session, idx = self._do_search()
         full_threads = self.data.get('full', False)
         session.displayed = SearchResults(session, idx,
-                                          start=start, num=num,
+                                          start=self._start,
+                                          num=self._num,
                                           full_threads=full_threads)
-        session.ui.mark(_('Prepared %d search results') % len(session.results))
+        session.ui.mark(_('Prepared %d search results (context=%s)'
+                          ) % (len(session.results), self.context))
         return self._success(_('Found %d results in %.3fs'
                                ) % (len(session.results),
                                     session.ui.report_marks(quiet=True)),
@@ -157,6 +221,7 @@ class Next(Search):
     SYNOPSIS = ('n', 'next', None, None)
     ORDER = ('Searching', 1)
     HTTP_CALLABLE = ()
+    COMMAND_CACHE_TTL = 0
 
     def command(self):
         session = self.session
@@ -175,6 +240,7 @@ class Previous(Search):
     SYNOPSIS = ('p', 'previous', None, None)
     ORDER = ('Searching', 2)
     HTTP_CALLABLE = ()
+    COMMAND_CACHE_TTL = 0
 
     def command(self):
         session = self.session
@@ -193,6 +259,7 @@ class Order(Search):
     SYNOPSIS = ('o', 'order', None, '<how>')
     ORDER = ('Searching', 3)
     HTTP_CALLABLE = ()
+    COMMAND_CACHE_TTL = 0
 
     def command(self):
         session, idx = self.session, self._idx()
@@ -210,6 +277,7 @@ class View(Search):
     HTTP_QUERY_VARS = {
         'mid': 'metadata-ID'
     }
+    COMMAND_CACHE_TTL = 0
 
     class RawResult(dict):
         def _decode(self):
@@ -247,6 +315,8 @@ class View(Search):
         session, config, idx = self.session, self.session.config, self._idx()
         results = []
         args = list(self.args)
+        args.extend(['=%s' % mid.replace('=', '')
+                     for mid in self.data.get('mid', [])])
         if args and args[0].lower() == 'raw':
             raw = args.pop(0)
         else:
@@ -274,21 +344,21 @@ class View(Search):
                     old_result.add_email(email)
                     continue
 
-                conv = [int(c[0], 36) for c
-                        in idx.get_conversation(msg_idx=email.msg_idx_pos)]
-                if email.msg_idx_pos not in conv:
-                    conv.append(email.msg_idx_pos)
+                # Get conversation
+                conv = idx.get_conversation(msg_idx=email.msg_idx_pos)
 
-                # FIXME: This is a hack. The indexer should just keep things
-                #        in the right order on rescan. Fixing threading is a
-                #        bigger problem though, so we do this for now.
-                def sort_conv_key(msg_idx_pos):
-                    info = idx.get_msg_at_idx_pos(msg_idx_pos)
+                # Sort our results by date...
+                def sort_conv_key(info):
                     return -int(info[idx.MSG_DATE], 36)
                 conv.sort(key=sort_conv_key)
 
+                # Convert to index positions only
+                conv = [int(info[idx.MSG_MID], 36) for info in conv]
+
                 session.results = conv
-                results.append(SearchResults(session, idx, emails=[email]))
+                results.append(SearchResults(session, idx,
+                                             emails=[email],
+                                             num=len(conv)))
         if len(results) == 1:
             return self._success(_('Displayed a single message'),
                                  result=results[0])
@@ -338,8 +408,10 @@ class Extract(Command):
             mode = args.pop(0)
 
         if len(args) > 0 and args[-1].startswith('>'):
-            if self.session.config.sys.lockdown:
-                return self._error(_('In lockdown, doing nothing.'))
+            forbid = security.forbid_command(self,
+                                             security.CC_ACCESS_FILESYSTEM)
+            if forbid:
+                return self._error(forbid)
             name_fmt = args.pop(-1)[1:]
 
         if (args[0].startswith('#') or
@@ -382,12 +454,17 @@ def mailbox_search(config, idx, term, hits):
     except ValueError:
         mbox_id = None
 
-    mailboxes = [m for m in config.sys.mailbox.keys()
-                 if (mbox_id == m) or word in config.sys.mailbox[m].lower()]
+    mailboxes = []
+    for m in config.sys.mailbox.keys():
+        fn = FilePath(config.sys.mailbox[m]).display().lower()
+        if (mbox_id == m) or word in fn:
+            mailboxes.append(m)
+
     rt = []
     for mbox_id in mailboxes:
         mbox_id = FormatMbxId(mbox_id)
         rt.extend(hits('%s:mailbox' % mbox_id))
+
     return rt
 
 

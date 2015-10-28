@@ -28,18 +28,27 @@ class MailpileMailbox(mailbox.mbox):
     def __init__(self, *args, **kwargs):
         mailbox.mbox.__init__(self, *args, **kwargs)
         self.editable = False
+        self.is_local = False
         self._mtime = 0
         self._save_to = None
         self._encryption_key_func = lambda: None
         self._decryption_key_func = lambda: None
-        self._lock = MboxLock()
+        self._lock = MboxRLock()
+
+    def __enter__(self, *args, **kwargs):
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *args, **kwargs):
+        self._lock.release()
 
     def _get_fd(self):
         return open(self._path, 'rb+')
 
     def __setstate__(self, dict):
         self.__dict__.update(dict)
-        self._lock = MboxLock()
+        self._lock = MboxRLock()
+        self.is_local = False
         with self._lock:
             self._save_to = None
             self._encryption_key_func = lambda: None
@@ -117,9 +126,17 @@ class MailpileMailbox(mailbox.mbox):
 
     def get_msg_size(self, toc_id):
         try:
-            return self._toc[toc_id][1] - self._toc[toc_id][0]
+            with self._lock:
+                return self._toc[toc_id][1] - self._toc[toc_id][0]
         except (IndexError, KeyError, IndexError, TypeError):
             return 0
+
+    def get_metadata_keywords(self, toc_id):
+        # In an mbox, all metadata is in the message headers.
+        return []
+
+    def set_metadata_keywords(self, *args, **kwargs):
+        pass
 
     def get_msg_cs(self, start, cs_size, max_length):
         with self._lock:
@@ -139,8 +156,9 @@ class MailpileMailbox(mailbox.mbox):
         return self.get_msg_cs(start, 80, max_length)
 
     def get_msg_ptr(self, mboxid, toc_id):
-        msg_start = self._toc[toc_id][0]
-        msg_size = self.get_msg_size(toc_id)
+        with self._lock:
+            msg_start = self._toc[toc_id][0]
+            msg_size = self.get_msg_size(toc_id)
         return '%s%s:%s:%s' % (mboxid,
                                b36(msg_start),
                                b36(msg_size),
@@ -163,6 +181,9 @@ class MailpileMailbox(mailbox.mbox):
         # accessing the same mailbox and moving it around, or in case we have
         # multiple PartialFile objects in flight at once.
         return mailbox._PartialFile(self._get_fd(), start, start + length)
+
+    def get_bytes(self, toc_id, *args):
+        return self.get_file(toc_id).read(*args)
 
 
 mailpile.mailboxes.register(90, MailpileMailbox)

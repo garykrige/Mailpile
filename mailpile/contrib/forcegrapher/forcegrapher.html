@@ -1,0 +1,78 @@
+{% extends "layouts/" + render_mode + "-wide.html" %}
+{% block title %}Use The Force, Grapher{% endblock %}
+{% block content %}
+{% if result %}
+
+<div id="content-tools">
+  {% include("partials/tools_search.html") ignore missing %}
+</div>
+<div id="content-view">
+  <div id="pile-graph" style="background: #FFFFFF; display: block; position: relative;">
+    <div id="graph-actions" style="position: absolute; top: 10px; right: 20px;" class="clearfix">
+      <a style="display: none;" id="btn-compose-message" class="bulk-action" href="#add-to-group"><span class="icon-compose"></span> Compose Message to Selected</a>
+      <a style="display: none;" id="btn-found-group" class="bulk-action" href="#add-to-group"><span class="icon-groups"></span> Add Selected to Group</a>
+    </div>
+    <div id="pile-graph-canvas" style="width: 100%;">
+      <svg id="pile-graph-canvas-svg" width="100%" height="500"></svg>
+    </div>
+  </div>
+</div>
+
+<script id="modal-grapher-node-detail" type="text/template">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <button type="button" class="close button-info" data-dismiss="modal" aria-hidden="true">&times;</button>
+        <h4 class="modal-title">
+          <span class="icon-user"></span> 
+          <% if (name) { %>
+          <%= name %>
+          <% } else { %>
+          <%= email %>
+          <% } %>
+        </h4>
+      </div>
+      <div class="modal-body clearfix">
+        <% if (search.metadata) { %>
+        <p style="padding: 10px 15px; background: #d9d9d9;"><strong><%= search.metadata.length %> Recent Tags & Messages from: <%= email %></strong></p>
+
+        <% var shown_tags = [] %>
+        <ul class="horizontal">
+        <% _.each(search.metadata, function(msg, mid) { %>
+          <% _.each(msg.tag_tids, function(tid) { var tag = _.findWhere(Mailpile.instance.tags, {tid: tid}) %>
+            <% if (_.indexOf(shown_tags, tid) == -1 && _.indexOf(['priority', 'tag', 'archive'], tag.display) > -1) { shown_tags.push(tid) %>
+            <li class="half-right"><a href="/search/?q=in:<%= tag.slug %>" target="_blank" title="Search for Tag">
+              <span class="<%= tag.icon %>"></span> <%= tag.name %></a> &nbsp;
+            </li>
+            <% } %>
+          <% }) %>
+        <% }) %>
+        </ul>
+        <ul>
+        <% _.each(search.metadata, function(msg, mid) { %>
+        <li>
+          <hr class="half-top half-bottom">
+          <h4 class="half-bottom">
+            <a href="<%= msg.urls.thread %>"><%= msg.subject %> <span class="icon-lock-closed <%= msg.crypto.encryption %>"></span></a> 
+          </h4>
+          <span class="color:#999"><%= msg.body.snippet %>... <a href="<%= msg.urls.thread %>" target="_blank">View Thread</a></span>
+        </li>
+        <% }) %>
+        </ul>
+        <% } else { %>
+        No results found for address: <%= email %>
+        <% } %>
+      </div>
+    </div>
+  </div>
+</script>
+
+
+<script>
+$(document).ready(function() {
+	var data = {{result|json|safe}};
+	Mailpile.plugins.forcegrapher.draw(data);
+});
+</script>
+{% endif %}
+{% endblock %}

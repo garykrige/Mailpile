@@ -3,8 +3,10 @@ import hashlib
 import smtplib
 import socket
 import sys
+import time
 
 import mailpile.util
+from mailpile.conn_brokers import Master as ConnBroker
 from mailpile.util import *
 from mailpile.i18n import gettext as _
 from mailpile.i18n import ngettext as _n
@@ -74,32 +76,11 @@ def SMTorP_HashCash(rcpt, msg, callback1k=None):
                                                 callback1k=cb))
 
 
-def _AddSocksHooks(cls, SSL=False):
-
-    class Socksified(cls):
-        def _get_socket(self, host, port, timeout):
-            new_socket = self.socket()
-            new_socket.connect((host, port))
-
-            if SSL and ssl is not None:
-                new_socket = ssl.wrap_socket(new_socket,
-                                             self.keyfile, self.certfile)
-                self.file = smtplib.SSLFakeFile(new_socket)
-
-            return new_socket
-
-        def connect(self, host='localhost', port=0, socket_cls=None):
-            self.socket = socket_cls or socket.socket
-            return cls.connect(self, host=host, port=port)
-
-    return Socksified
-
-
-class SMTP(_AddSocksHooks(smtplib.SMTP)):
+class SMTP(smtplib.SMTP):
     pass
 
 if ssl is not None:
-    class SMTP_SSL(_AddSocksHooks(smtplib.SMTP_SSL, SSL=True)):
+    class SMTP_SSL(smtplib.SMTP_SSL):
         pass
 else:
     SMTP_SSL = SMTP
@@ -114,7 +95,8 @@ class SendMailError(IOError):
 def _RouteTuples(session, from_to_msg_ev_tuples, test_route=None):
     tuples = []
     for frm, to, msg, events in from_to_msg_ev_tuples:
-        dest = {}
+        rcpts = {}
+        routes = {}
         for recipient in to:
             # If any of the events thinks this message has been delivered,
             # then don't try to send it again.
@@ -129,27 +111,21 @@ def _RouteTuples(session, from_to_msg_ev_tuples, test_route=None):
                          "password": "",
                          "command": "",
                          "host": "",
-                         "port": 25
-                         }
+                         "port": 25}
 
                 if test_route:
                     route.update(test_route)
                 else:
-                    route.update(session.config.get_sendmail(frm, [recipient]))
+                    route.update(session.config.get_route(frm, [recipient]))
 
-                if route["command"]:
-                    txtroute = "|%(command)s" % route
-                else:
-                    # FIXME: This is dumb, makes it hard to handle usernames
-                    #        or passwords with funky characters in them :-(
-                    txtroute = "%(protocol)s://%(username)s:%(password)s@" \
-                               + "%(host)s:%(port)d"
-                    txtroute %= route
-
-                dest[txtroute] = dest.get(txtroute, [])
-                dest[txtroute].append(recipient)
-        for route in dest:
-            tuples.append((frm, route, dest[route], msg, events))
+                # Group together recipients that use the same route
+                rid = '/'.join(sorted(['%s' % (k, )
+                                       for k in route.iteritems()]))
+                routes[rid] = route
+                rcpts[rid] = rcpts.get(rid, [])
+                rcpts[rid].append(recipient)
+        for rid in rcpts:
+            tuples.append((frm, routes[rid], rcpts[rid], msg, events))
     return tuples
 
 
@@ -166,12 +142,12 @@ def SendMail(session, msg_mid, from_to_msg_ev_tuples,
 
     # Update initial event state before we go through and start
     # trying to deliver stuff.
-    for frm, sendmail, to, msg, events in routes:
+    for frm, route, to, msg, events in routes:
         for ev in (events or []):
             for rcpt in to:
                 ev.private_data['>'.join([frm, rcpt])] = False
 
-    for frm, sendmail, to, msg, events in routes:
+    for frm, route, to, msg, events in routes:
         for ev in events:
             ev.data['recipients'] = len(ev.private_data.keys())
             ev.data['delivered'] = len([k for k in ev.private_data
@@ -198,27 +174,25 @@ def SendMail(session, msg_mid, from_to_msg_ev_tuples,
                  details={'smtp_error': '%s: %s' % (rc, msg)})
 
     # Do the actual delivering...
-    for frm, sendmail, to, msg, events in routes:
-        frm_vcard = session.config.vcards.get_vcard(frm)
+    for frm, route, to, msg, events in routes:
+        route_description = route['command'] or route['host']
 
-        update_to_vcards = False
-        if msg and msg["x-mp-internal-pubkeys-attached"]:
-            update_to_vcards = True
-            to_vcards = [session.config.vcards.get_vcard(x) for x in to]
-            del(msg["x-mp-internal-pubkeys-attached"])
+        frm_vcard = session.config.vcards.get_vcard(frm)
+        update_to_vcards = msg and msg["x-mp-internal-pubkeys-attached"]
 
         if 'sendmail' in session.config.sys.debug:
-            sys.stderr.write(_('SendMail: from %s (%s), to %s via %s\n'
-                               ) % (frm,
-                                    frm_vcard and frm_vcard.random_uid or '',
-                                    to, sendmail.split('@')[-1]))
+            sys.stderr.write(_('SendMail: from %s (%s), to %s via %s\n')
+                             % (frm, frm_vcard and frm_vcard.random_uid or '',
+                                to, route_description))
         sm_write = sm_close = lambda: True
 
-        mark(_('Connecting to %s') % sendmail.split('@')[-1], events)
+        mark(_('Sending via %s') % route_description, events)
 
-        if sendmail.startswith('|'):
-            sendmail %= {"rcpt": ",".join(to)}
-            cmd = sendmail[1:].strip().split()
+        if route['command']:
+            # Note: The .strip().split() here converts our cmd into a list,
+            #       which should ensure that Popen does not spawn a shell
+            #       with potentially exploitable arguments.
+            cmd = (route['command'] % {"rcpt": ",".join(to)}).strip().split()
             proc = Popen(cmd, stdin=PIPE, long_running=True)
             sm_startup = None
             sm_write = proc.stdin.write
@@ -237,19 +211,11 @@ def SendMail(session, msg_mid, from_to_msg_ev_tuples,
                 ev.data['proto'] = 'subprocess'
                 ev.data['command'] = cmd[0]
 
-        elif (sendmail.startswith('smtp:') or
-              sendmail.startswith('smtorp:') or
-              sendmail.startswith('smtpssl:') or
-              sendmail.startswith('smtptls:')):
-            proto = sendmail.split(':', 1)[0]
-            host, port = sendmail.split(':', 1
-                                        )[1].replace('/', '').rsplit(':', 1)
+        elif route['protocol'] in ('smtp', 'smtorp', 'smtpssl', 'smtptls'):
+            proto = route['protocol']
+            host, port = route['host'], route['port']
+            user, pwd = route['username'], route['password']
             smtp_ssl = proto in ('smtpssl', )  # FIXME: 'smtorp'
-            if '@' in host:
-                userpass, host = host.rsplit('@', 1)
-                user, pwd = userpass.split(':', 1)
-            else:
-                user = pwd = None
 
             for ev in events:
                 ev.data['proto'] = proto
@@ -260,35 +226,55 @@ def SendMail(session, msg_mid, from_to_msg_ev_tuples,
                 sys.stderr.write(_('SMTP connection to: %s:%s as %s\n'
                                    ) % (host, port, user or '(anon)'))
 
-            server = (smtp_ssl and SMTP_SSL or SMTP
-                      )(local_hostname='mailpile.local', timeout=25)
-
-            def sm_startup():
+            serverbox = [None]
+            def sm_connect_server():
+                server = (smtp_ssl and SMTP_SSL or SMTP
+                          )(local_hostname='mailpile.local', timeout=25)
                 if 'sendmail' in session.config.sys.debug:
                     server.set_debuglevel(1)
-                if proto == 'smtorp':
-                    server.connect(host, int(port),
-                                   socket_cls=session.config.get_tor_socket())
+                if smtp_ssl or proto in ('smtorp', 'smtptls'):
+                    conn_needs = [ConnBroker.OUTGOING_ENCRYPTED]
                 else:
-                    server.connect(host, int(port))
+                    conn_needs = [ConnBroker.OUTGOING_SMTP]
+                try:
+                    with ConnBroker.context(need=conn_needs) as ctx:
+                        server.connect(host, int(port))
+                        server.ehlo_or_helo_if_needed()
+                except (IOError, OSError, smtplib.SMTPServerDisconnected):
+                    fail(_('Failed to connect to %s') % host, events,
+                         details={'connection_error': True})
+
+                return server
+
+            def sm_startup():
+                server = sm_connect_server()
                 if not smtp_ssl:
                     # We always try to enable TLS, even if the user just
                     # requested plain-text smtp.  But we only throw errors
                     # if the user asked for encryption.
                     try:
                         server.starttls()
+                        server.ehlo_or_helo_if_needed()
                     except:
-                        if sendmail.startswith('smtptls'):
+                        if proto == 'smtptls':
                             raise InsecureSmtpError()
+                        else:
+                            server = sm_connect_server()
+                serverbox[0] = server
+
                 if user and pwd:
                     try:
-                        server.login(user.encode('utf-8'), pwd.encode('utf-8'))
+                        server.login(user.encode('utf-8'),
+                                     pwd.encode('utf-8'))
                     except UnicodeDecodeError:
                         fail(_('Bad character in username or password'),
                              events,
                              details={'authentication_error': True})
                     except smtplib.SMTPAuthenticationError:
                         fail(_('Invalid username or password'), events,
+                             details={'authentication_error': True})
+                    except smtplib.SMTPException:
+                        fail(_('Authentication not supported'), events,
                              details={'authentication_error': True})
 
                 smtp_do_or_die(_('Sender rejected by SMTP server'),
@@ -299,28 +285,30 @@ def SendMail(session, msg_mid, from_to_msg_ev_tuples,
                             msg.startswith(SMTORP_HASHCASH_PREFIX)):
                         rc, msg = server.rcpt(SMTorP_HashCash(rcpt, msg))
                     if rc != 250:
-                        fail(_('Server rejected recpient: %s') % rcpt, events)
+                        fail(_('Server rejected recipient: %s') % rcpt, events)
                 rcode, rmsg = server.docmd('DATA')
                 if rcode != 354:
                     fail(_('Server rejected DATA: %s %s') % (rcode, rmsg))
 
             def sm_write(data):
+                server = serverbox[0]
                 for line in data.splitlines(True):
                     if line.startswith('.'):
                         server.send('.')
                     server.send(line)
 
             def sm_close():
+                server = serverbox[0]
                 server.send('\r\n.\r\n')
                 smtp_do_or_die(_('Error spooling mail'),
                                events, server.getreply)
 
             def sm_cleanup():
+                server = serverbox[0]
                 if hasattr(server, 'sock'):
                     server.close()
         else:
-            fail(_('Invalid sendmail command/SMTP server: %s') % sendmail,
-                 events)
+            fail(_('Invalid route: %s') % route, events)
 
         try:
             # Run the entire connect/login sequence in a single timer, but
@@ -350,11 +338,6 @@ def SendMail(session, msg_mid, from_to_msg_ev_tuples,
                     total
                     ) % total, events)
 
-            if update_to_vcards:
-                now = datetime.datetime.now().strftime("%s")
-                for vc in to_vcards:
-                    vc.gpgshared = now
-
             for ev in events:
                 for rcpt in to:
                     vcard = session.config.vcards.get_vcard(rcpt)
@@ -362,6 +345,8 @@ def SendMail(session, msg_mid, from_to_msg_ev_tuples,
                         vcard.record_history('send', time.time(), msg_mid)
                         if frm_vcard:
                             vcard.prefer_sender(rcpt, frm_vcard)
+                        if update_to_vcards:
+                            vcard.pgp_key_shared = int(time.time())
                         vcard.save()
                     ev.private_data['>'.join([frm, rcpt])] = True
                 ev.data['bytes'] = total
